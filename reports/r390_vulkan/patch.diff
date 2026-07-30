@@ -1,0 +1,330 @@
+diff --git a/c/backend_vulkan.c b/c/backend_vulkan.c
+index d779607..e004d8e 100644
+--- a/c/backend_vulkan.c
++++ b/c/backend_vulkan.c
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#include <pthread.h>
+ static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
+
+ #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
+@@ -102,6 +103,16 @@ static struct {
+      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
+     int has_prio, has_budget;
+     float prio;                  /* priority applied to the NEXT allocations (class knob) */
++
++    /* Staged expert tier state (no-ReBAR) */
++    int use_staged;
++    VkBuffer stage_buf;
++    VkDeviceMemory stage_mem;
++    void *stage_ptr;
++    size_t stage_cap;
++    VkCommandBuffer stage_cmd;
++    VkFence stage_fence;
++    pthread_mutex_t stage_mutex;
+ } G;
+
+ struct PC { int fmt, S, I, O, rowWords, gs; };
+@@ -109,6 +120,21 @@ struct PCN { int S, D; float eps; };
+ /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
+ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
+
++static int pick_memtype_device_local(VkPhysicalDevice phys, uint32_t memoryTypeBits) {
++    VkPhysicalDeviceMemoryProperties m;
++    vkGetPhysicalDeviceMemoryProperties(phys, &m);
++    int best = -1;
++    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
++        if ((memoryTypeBits & (1u << i)) == 0) continue;
++        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
++        if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
++            if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return (int)i; // strict device local
++            if (best < 0) best = (int)i;
++        }
++    }
++    return best;
++}
++
+ static int pick_memtype(VkPhysicalDevice phys) {
+     VkPhysicalDeviceMemoryProperties m;
+     vkGetPhysicalDeviceMemoryProperties(phys, &m);
+@@ -462,50 +488,71 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
+  * live for the process; the rare fill-failure free leaks its slice, bounded) — a
+  * tensor's mem handle stays VK_NULL_HANDLE, which coli_vk_tensor_free's vkFreeMemory
+  * treats as the documented no-op. */
+-typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
++typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; uint32_t memtype; int mapped; struct VkWArena *next; } VkWArena;
+ static VkWArena *g_warena;
+ #define VK_WARENA_BLOCK ((size_t)256 << 20)
++static int arena_suballoc_mt(size_t bytes, VkBuffer *buf, void **ptr, uint32_t memtype, int usage);
+ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
++    return arena_suballoc_mt(bytes, buf, ptr, G.memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++}
++static int arena_suballoc_mt(size_t bytes, VkBuffer *buf, void **ptr, uint32_t memtype, int usage) {
+     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++        .size = bytes, .usage = usage,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
+     VkMemoryRequirements req;
+     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
+-    if (!(req.memoryTypeBits & (1u << G.memtype))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
++    if (!(req.memoryTypeBits & (1u << memtype))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+     size_t align = req.alignment ? req.alignment : 256, off = 0;
+     VkWArena *a = g_warena;
+     for (; a; a = a->next) {
+-        off = (a->off + align - 1) & ~(align - 1);
+-        if (off + req.size <= a->cap) break;
++        if (a->memtype == memtype) {
++            off = (a->off + align - 1) & ~(align - 1);
++            if (off + req.size <= a->cap) break;
++        }
+     }
+     if (!a) {
+         size_t cap = req.size > VK_WARENA_BLOCK ? (req.size + 4095) & ~(size_t)4095 : VK_WARENA_BLOCK;
+         a = calloc(1, sizeof(*a));
+         if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-            .allocationSize = cap, .memoryTypeIndex = G.memtype};
++            .allocationSize = cap, .memoryTypeIndex = memtype};
+ #ifdef VK_EXT_memory_priority
+         VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+             .priority = G.prio};
+         if (G.has_prio) ai.pNext = &pri;
+ #endif
+-        if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
+-            vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+-            if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
++        if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS) {
+             free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+         }
++        a->memtype = memtype;
++        VkPhysicalDeviceMemoryProperties mp;
++        vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
++        VkMemoryPropertyFlags flags = mp.memoryTypes[memtype].propertyFlags;
++        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
++            if (vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) == VK_SUCCESS) {
++                a->mapped = 1;
++            } else {
++                vkFreeMemory(G.dev, a->mem, NULL);
++                free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
++            }
++        } else {
++            a->base = NULL;
++            a->mapped = 0;
++        }
+         a->cap = cap; a->next = g_warena; g_warena = a;
+         off = 0;
+     }
+     VKCHECK(vkBindBufferMemory(G.dev, *buf, a->mem, off), "vkBindBufferMemory");
+-    if (ptr) *ptr = a->base + off;
++    if (ptr) *ptr = a->mapped ? a->base + off : NULL;
+     a->off = off + req.size;
+     return 1;
+ }
+
++enum ColiVkPlacement { COLI_VK_HOST_VISIBLE, COLI_VK_DEVICE_LOCAL_STAGED };
++
+ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
+-                         int fmt, int I, int O, int gs) {
++                         int fmt, int I, int O, int gs, enum ColiVkPlacement placement) {
+     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+     if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
+         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
+@@ -518,16 +565,100 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
+     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
+     t->wbytes = stride * (size_t)O;
+     void *wptr;
+-    if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
+-    memset(wptr, 0, t->wbytes);
+-    for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
+-        memcpy((uint8_t *)wptr + (size_t)o * stride,
+-               (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+     void *sptr;
+-    if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
++
++    uint32_t memtype = G.memtype;
++    int usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++    int do_stage = 0;
++
++    if (placement == COLI_VK_DEVICE_LOCAL_STAGED && G.use_staged && G.stage_buf) {
++        usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++        // Probe required memory type for DEVICE_LOCAL
++        VkBufferCreateInfo dummy_bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
++        VkBuffer dummy;
++        if (vkCreateBuffer(G.dev, &dummy_bi, NULL, &dummy) == VK_SUCCESS) {
++            VkMemoryRequirements dreq;
++            vkGetBufferMemoryRequirements(G.dev, dummy, &dreq);
++            int dl_mt = pick_memtype_device_local(G.phys, dreq.memoryTypeBits);
++            if (dl_mt >= 0) {
++                memtype = (uint32_t)dl_mt;
++                do_stage = 1;
++            }
++            vkDestroyBuffer(G.dev, dummy, NULL);
++        }
++    }
++
++    if (!arena_suballoc_mt(t->wbytes, &t->wbuf, &wptr, memtype, usage)) { free(t); return 0; }
++    if (!arena_suballoc_mt(sfl * sizeof(float), &t->sbuf, &sptr, memtype, usage)) {
+         vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
+     }
+-    memcpy(sptr, scales, sfl * sizeof(float));
++
++    if (do_stage) {
++        if (t->wbytes + sfl * sizeof(float) > G.stage_cap) {
++            fprintf(stderr, "[VK] warning: staged upload failed, buffer too small\n");
++            vkDestroyBuffer(G.dev, t->sbuf, NULL); vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
++        }
++
++        pthread_mutex_lock(&G.stage_mutex);
++
++        // Copy weights into staging buffer
++        memset(G.stage_ptr, 0, t->wbytes);
++        for (int o = 0; o < O; o++)
++            memcpy((uint8_t *)G.stage_ptr + (size_t)o * stride,
++                   (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
++
++        // Copy scales into staging buffer
++        memcpy((uint8_t *)G.stage_ptr + t->wbytes, scales, sfl * sizeof(float));
++
++        // Submit transfer
++        vkResetCommandBuffer(G.stage_cmd, 0);
++        VkCommandBufferBeginInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++        if (vkBeginCommandBuffer(G.stage_cmd, &cbi) == VK_SUCCESS) {
++            VkBufferCopy r_w = {.srcOffset = 0, .dstOffset = 0, .size = t->wbytes};
++            vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->wbuf, 1, &r_w);
++            if (sfl > 0) {
++                VkBufferCopy r_s = {.srcOffset = t->wbytes, .dstOffset = 0, .size = sfl * sizeof(float)};
++                vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->sbuf, 1, &r_s);
++            }
++
++            VkBufferMemoryBarrier barriers[2];
++            barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++            barriers[0].pNext = NULL;
++            barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++            barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            barriers[0].buffer = t->wbuf;
++            barriers[0].offset = 0;
++            barriers[0].size = VK_WHOLE_SIZE;
++
++            barriers[1] = barriers[0];
++            barriers[1].buffer = t->sbuf;
++
++            vkCmdPipelineBarrier(G.stage_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, (sfl>0?2:1), barriers, 0, NULL);
++
++            if (vkEndCommandBuffer(G.stage_cmd) == VK_SUCCESS) {
++                vkResetFences(G.dev, 1, &G.stage_fence);
++                VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.stage_cmd};
++                if (vkQueueSubmit(G.queue, 1, &si, G.stage_fence) == VK_SUCCESS) {
++                    vkWaitForFences(G.dev, 1, &G.stage_fence, VK_TRUE, 5000000000ULL);
++                }
++            }
++        }
++
++        pthread_mutex_unlock(&G.stage_mutex);
++    } else {
++        if (wptr) {
++            memset(wptr, 0, t->wbytes);
++            for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
++                memcpy((uint8_t *)wptr + (size_t)o * stride,
++                       (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
++        }
++        if (sptr) {
++            memcpy(sptr, scales, sfl * sizeof(float));
++        }
++    }
++
+     // Counters are touched concurrently: frees run from expert_load under
+     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
+     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
+@@ -540,7 +671,8 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
+  * uploaded once, then driven by coli_vk_expert_group). Returns 0 on failure. */
+ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
+     if (!G.ready) return 0;
+-    return upload_tensor(tensor, weights, scales, fmt, I, O, grp);
++    // Routed experts use the staged path if enabled.
++    return upload_tensor(tensor, weights, scales, fmt, I, O, grp, COLI_VK_DEVICE_LOCAL_STAGED);
+ }
+
+ /* Sync-path fence wait. A blocked vkWaitForFences pays a scheduler wake on
+@@ -578,7 +710,7 @@ static void vkprof_tick(void) {
+ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
+                    const void *weights, const float *scales,
+                    int fmt, int S, int I, int O, int gs) {
+-    if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
++    if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *t = *tensor;
+     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
+      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
+@@ -662,7 +794,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
+                     const void *gw, const float *gs, const void *uw, const float *us,
+                     int fmt, int S, int D, int I, int grp) {
+     if (!G.ready || !G.shader_gu || S < 1 || D > 6144) return 0;   /* shader stages x in xsh[6144] */
+-    if (!upload_tensor(gate, gw, gs, fmt, D, I, grp) || !upload_tensor(up, uw, us, fmt, D, I, grp)) return 0;
++    if (!upload_tensor(gate, gw, gs, fmt, D, I, grp, COLI_VK_HOST_VISIBLE) || !upload_tensor(up, uw, us, fmt, D, I, grp, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *tg = *gate, *tu = *up;
+     size_t xb = (size_t)S * D * sizeof(float), hb = (size_t)S * I * sizeof(float);
+     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.h, hb, G.memtype_cached)) return 0;  /* hidden read back */
+@@ -1227,7 +1359,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
+     if (Q > 256 || R > 64 || K > 512 || st0 < 0 || T - S - st0 < 0) return 0;  /* shared-array limits */
+     VkKvLayer *kv = &G.kv[layer];
+     if (!kv->bl || kv->rows < T || kv->K != K || kv->R != R) return 0;
+-    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp)) return 0;
++    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *t = *kvb;
+     int cap = T - st0;
+     size_t qb = (size_t)S * H * (Q + R) * 4, cb = (size_t)S * H * V * 4;
+@@ -1278,7 +1410,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
+                         ColiVkTensor **t2p, float *y2, const void *w2, const float *s2, int O2,
+                         int fmt, const float *x, int S, int I, int grp) {
+     if (!G.ready || S < 1) return 0;
+-    if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
++    if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp, COLI_VK_HOST_VISIBLE) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
+     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
+     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||
+@@ -1345,8 +1477,8 @@ int coli_vk_attn_qprep(int layer,
+                        int fmt, int grp, const float *lnw, float eps,
+                        const float *x, int S, int I, float *q_out, float *kv_out, float *lat_out) {
+     if (!G.ready || !G.shader_nrm || S < 1 || layer < 0 || layer >= VK_KV_LAYERS) return 0;
+-    if (!upload_tensor(qa, wqa, sqa, fmt, I, Oqa, grp) || !upload_tensor(kva, wkva, skva, fmt, I, Okva, grp) ||
+-        !upload_tensor(qb, wqb, sqb, fmt, Oqa, Oqb, grp)) return 0;
++    if (!upload_tensor(qa, wqa, sqa, fmt, I, Oqa, grp, COLI_VK_HOST_VISIBLE) || !upload_tensor(kva, wkva, skva, fmt, I, Okva, grp, COLI_VK_HOST_VISIBLE) ||
++        !upload_tensor(qb, wqb, sqb, fmt, Oqa, Oqb, grp, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *tqa = *qa, *tkv = *kva, *tqb = *qb;
+     if (!G.lnbuf[layer]) {                       /* resident norm weights, uploaded once */
+         void *lp; float p0 = G.prio; G.prio = 1.0f;
+@@ -1446,8 +1578,8 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
+     if (Q > 256 || R > 64 || K > 512 || st0 < 0 || T - S - st0 < 0 || Dout < 1) return 0;
+     VkKvLayer *kv = &G.kv[layer];
+     if (!kv->bl || kv->rows < T || kv->K != K || kv->R != R) return 0;
+-    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp)) return 0;
+-    if (!upload_tensor(ot, ow, osc, ofmt, H * V, Dout, ogrp)) return 0;
++    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp, COLI_VK_HOST_VISIBLE)) return 0;
++    if (!upload_tensor(ot, ow, osc, ofmt, H * V, Dout, ogrp, COLI_VK_HOST_VISIBLE)) return 0;
+     ColiVkTensor *t = *kvb, *to = *ot;
+     int cap = T - st0;
+     size_t qb = (size_t)S * H * (Q + R) * 4, cb = (size_t)S * H * V * 4;
+@@ -1572,10 +1704,18 @@ void coli_vk_shutdown(void) {
+     }
+     for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
+         VkWArena *nx = a->next;
+-        vkUnmapMemory(G.dev, a->mem); vkFreeMemory(G.dev, a->mem, NULL);
++        if (a->mapped) vkUnmapMemory(G.dev, a->mem);
++        vkFreeMemory(G.dev, a->mem, NULL);
+         free(a); a = nx;
+     }
+     g_warena = NULL;
++
++    if (G.use_staged) {
++        if (G.stage_buf) vkDestroyBuffer(G.dev, G.stage_buf, NULL);
++        if (G.stage_mem) { vkUnmapMemory(G.dev, G.stage_mem); vkFreeMemory(G.dev, G.stage_mem, NULL); }
++        if (G.stage_fence) vkDestroyFence(G.dev, G.stage_fence, NULL);
++        pthread_mutex_destroy(&G.stage_mutex);
++    }
+     vkDestroyDevice(G.dev, NULL);
+     vkDestroyInstance(G.inst, NULL);
+     memset(&G, 0, sizeof(G));

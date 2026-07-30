@@ -1,0 +1,4 @@
+Configuration,TTFT,Prefill tok/s,Decode tok/s,RAM,VRAM,Correctness
+CPU Baseline,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN
+Upstream Vulkan (Experts),NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN
+Staged Vulkan (COLI_VK_STAGED=1),NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN,NOT_RUN
