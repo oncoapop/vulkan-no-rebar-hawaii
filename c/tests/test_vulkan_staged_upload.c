@@ -336,6 +336,11 @@ cleanup:
         vkDestroyInstance(instance, NULL);
     }
 
+/*
+ * Deliberate leak path: on VK_TIMEOUT, we bypass Vulkan cleanup.
+ * GPU work may still be in flight; destroying resources out from under it
+ * can crash the driver. Process exit will reclaim host memory safely.
+ */
 timeout_cleanup:
     return failed ? 1 : 0;
 }
