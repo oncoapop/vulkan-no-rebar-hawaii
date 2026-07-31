@@ -219,6 +219,9 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
+# Only compile Vulkan tests if Vulkan is actually available
+VULKAN_LDFLAGS = $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
+
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
@@ -565,6 +568,12 @@ test-c: $(TEST_BINS)
 # the pin was actually checked).
 test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+vulkan-test: tests/test_vulkan_staged_upload$(EXE)
+	./tests/test_vulkan_staged_upload$(EXE)
 
 test: test-c test-python
 
