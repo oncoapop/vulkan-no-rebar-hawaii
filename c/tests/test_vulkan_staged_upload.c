@@ -22,7 +22,8 @@
         VkResult res = (call); \
         if (res == VK_TIMEOUT) { \
             fprintf(stderr, "FAIL: %s (timed out)\n", msg); \
-            return 1; \
+            failed = 1; \
+            goto timeout_cleanup; \
         } else if (res != VK_SUCCESS) { \
             fprintf(stderr, "FAIL: %s (error %d)\n", msg, res); \
             failed = 1; \
@@ -40,6 +41,7 @@ int main() {
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    VkPhysicalDevice *devices = NULL;
     int failed = 0;
 
     VkApplicationInfo appInfo = {};
@@ -55,25 +57,41 @@ int main() {
     createInfo.pApplicationInfo = &appInfo;
 
     VkResult res = vkCreateInstance(&createInfo, NULL, &instance);
-    if (res != VK_SUCCESS) {
+    if (res == VK_ERROR_INCOMPATIBLE_DRIVER || res == VK_ERROR_EXTENSION_NOT_PRESENT || res == VK_ERROR_INITIALIZATION_FAILED) {
         printf("SKIP: Could not create Vulkan instance.\n");
         return 0;
+    } else if (res != VK_SUCCESS) {
+        printf("FAIL: vkCreateInstance failed with error %d.\n", res);
+        return 1;
     }
 
     uint32_t deviceCount = 0;
-    CHECK_VK(vkEnumeratePhysicalDevices(instance, &deviceCount, NULL), "vkEnumeratePhysicalDevices (count)");
-    if (deviceCount == 0) {
-        printf("SKIP: No Vulkan physical devices found.\n");
-        goto cleanup;
-    }
+    do {
+        res = vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
+        if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+            fprintf(stderr, "FAIL: vkEnumeratePhysicalDevices (count) (error %d)\n", res);
+            failed = 1;
+            goto cleanup;
+        }
+        if (deviceCount == 0) {
+            printf("SKIP: No Vulkan physical devices found.\n");
+            goto cleanup;
+        }
 
-    VkPhysicalDevice *devices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
-    if (!devices) {
-        printf("FAIL: Out of memory for physical devices array.\n");
-        failed = 1;
-        goto cleanup;
-    }
-    CHECK_VK(vkEnumeratePhysicalDevices(instance, &deviceCount, devices), "vkEnumeratePhysicalDevices (devices)");
+        if (devices) free(devices);
+        devices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
+        if (!devices) {
+            printf("FAIL: Out of memory for physical devices array.\n");
+            failed = 1;
+            goto cleanup;
+        }
+        res = vkEnumeratePhysicalDevices(instance, &deviceCount, devices);
+        if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+            fprintf(stderr, "FAIL: vkEnumeratePhysicalDevices (devices) (error %d)\n", res);
+            failed = 1;
+            goto cleanup;
+        }
+    } while (res == VK_INCOMPLETE);
 
     VkPhysicalDevice hawaiiDevice = VK_NULL_HANDLE;
     uint32_t hawaiiIds[] = {0x67B0, 0x67B1, 0x67B8, 0x67B9, 0x67A0, 0x67A1, 0x67A2, 0x67A8, 0x67A9};
@@ -92,8 +110,6 @@ int main() {
         }
         if (hawaiiDevice != VK_NULL_HANDLE) break;
     }
-
-    free(devices);
 
     if (hawaiiDevice == VK_NULL_HANDLE) {
         printf("SKIP: No AMD Hawaii GPU found.\n");
@@ -177,7 +193,7 @@ int main() {
 
     uint32_t stagingMemTypeIndex = (uint32_t)-1;
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((stagingMemReq.memoryTypeBits & (1 << i)) &&
+        if ((stagingMemReq.memoryTypeBits & (1u << i)) &&
             (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
             (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             stagingMemTypeIndex = i;
@@ -187,7 +203,7 @@ int main() {
 
     uint32_t deviceLocalMemTypeIndex = (uint32_t)-1;
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((deviceMemReq.memoryTypeBits & (1 << i)) &&
+        if ((deviceMemReq.memoryTypeBits & (1u << i)) &&
             (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
             !(memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
             deviceLocalMemTypeIndex = i;
@@ -313,9 +329,13 @@ cleanup:
         }
         vkDestroyDevice(device, NULL);
     }
+    if (devices) {
+        free(devices);
+    }
     if (instance != VK_NULL_HANDLE) {
         vkDestroyInstance(instance, NULL);
     }
 
+timeout_cleanup:
     return failed ? 1 : 0;
 }
