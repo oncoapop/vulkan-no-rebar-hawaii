@@ -7,21 +7,23 @@
 #define TEST_BUFFER_SIZE 1024
 #define FENCE_TIMEOUT 5000000000ULL // 5 seconds in nanoseconds
 
-#define CHECK_VK(res, msg) \
+#define CHECK_VK(call, msg) \
     do { \
-        if ((res) != VK_SUCCESS) { \
+        VkResult res = (call); \
+        if (res != VK_SUCCESS) { \
             fprintf(stderr, "FAIL: %s (error %d)\n", msg, res); \
             failed = 1; \
             goto cleanup; \
         } \
     } while (0)
 
-#define CHECK_VK_TIMEOUT(res, msg) \
+#define CHECK_VK_TIMEOUT(call, msg) \
     do { \
-        if ((res) == VK_TIMEOUT) { \
+        VkResult res = (call); \
+        if (res == VK_TIMEOUT) { \
             fprintf(stderr, "FAIL: %s (timed out)\n", msg); \
-            exit(1); \
-        } else if ((res) != VK_SUCCESS) { \
+            return 1; \
+        } else if (res != VK_SUCCESS) { \
             fprintf(stderr, "FAIL: %s (error %d)\n", msg, res); \
             failed = 1; \
             goto cleanup; \
@@ -59,14 +61,19 @@ int main() {
     }
 
     uint32_t deviceCount = 0;
-    vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
+    CHECK_VK(vkEnumeratePhysicalDevices(instance, &deviceCount, NULL), "vkEnumeratePhysicalDevices (count)");
     if (deviceCount == 0) {
         printf("SKIP: No Vulkan physical devices found.\n");
         goto cleanup;
     }
 
     VkPhysicalDevice *devices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
-    vkEnumeratePhysicalDevices(instance, &deviceCount, devices);
+    if (!devices) {
+        printf("FAIL: Out of memory for physical devices array.\n");
+        failed = 1;
+        goto cleanup;
+    }
+    CHECK_VK(vkEnumeratePhysicalDevices(instance, &deviceCount, devices), "vkEnumeratePhysicalDevices (devices)");
 
     VkPhysicalDevice hawaiiDevice = VK_NULL_HANDLE;
     uint32_t hawaiiIds[] = {0x67B0, 0x67B1, 0x67B8, 0x67B9, 0x67A0, 0x67A1, 0x67A2, 0x67A8, 0x67A9};
@@ -95,7 +102,17 @@ int main() {
 
     uint32_t queueFamilyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(hawaiiDevice, &queueFamilyCount, NULL);
+    if (queueFamilyCount == 0) {
+        printf("FAIL: No queue families found on the device.\n");
+        failed = 1;
+        goto cleanup;
+    }
     VkQueueFamilyProperties *queueFamilies = malloc(sizeof(VkQueueFamilyProperties) * queueFamilyCount);
+    if (!queueFamilies) {
+        printf("FAIL: Out of memory for queue families array.\n");
+        failed = 1;
+        goto cleanup;
+    }
     vkGetPhysicalDeviceQueueFamilyProperties(hawaiiDevice, &queueFamilyCount, queueFamilies);
 
     int transferQueueFamily = -1;
@@ -146,6 +163,17 @@ int main() {
     VkMemoryRequirements stagingMemReq, deviceMemReq;
     vkGetBufferMemoryRequirements(device, stagingBuffer, &stagingMemReq);
     vkGetBufferMemoryRequirements(device, deviceBuffer, &deviceMemReq);
+
+    if (stagingMemReq.size == 0 || stagingMemReq.memoryTypeBits == 0) {
+        printf("FAIL: Invalid staging buffer memory requirements.\n");
+        failed = 1;
+        goto cleanup;
+    }
+    if (deviceMemReq.size == 0 || deviceMemReq.memoryTypeBits == 0) {
+        printf("FAIL: Invalid device buffer memory requirements.\n");
+        failed = 1;
+        goto cleanup;
+    }
 
     uint32_t stagingMemTypeIndex = (uint32_t)-1;
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
