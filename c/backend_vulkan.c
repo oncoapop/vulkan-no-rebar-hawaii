@@ -113,26 +113,40 @@ static struct {
     VkCommandBuffer stage_cmd;
     VkFence stage_fence;
     pthread_mutex_t stage_mutex;
+    pthread_mutex_t queue_mutex;
 } G;
+
+int coli_vk_test_pick_memtype_device_local(uint32_t memoryTypeBits, uint32_t memoryTypeCount, const VkMemoryType* memoryTypes, const VkMemoryHeap* memoryHeaps);
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
-static int pick_memtype_device_local(VkPhysicalDevice phys, uint32_t memoryTypeBits) {
-    VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+int coli_vk_test_pick_memtype_device_local(uint32_t memoryTypeBits, uint32_t memoryTypeCount, const VkMemoryType* memoryTypes, const VkMemoryHeap* memoryHeaps) {
     int best = -1;
-    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+    VkDeviceSize best_size = 0;
+    for (uint32_t i = 0; i < memoryTypeCount; i++) {
         if ((memoryTypeBits & (1u << i)) == 0) continue;
-        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
-        if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-            if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return (int)i; // strict device local
-            if (best < 0) best = (int)i;
+        VkMemoryPropertyFlags f = memoryTypes[i].propertyFlags;
+        // Strictly DEVICE_LOCAL, strictly NOT HOST_VISIBLE
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            VkDeviceSize hp = memoryHeaps[memoryTypes[i].heapIndex].size;
+            if (hp > best_size) {
+                best = (int)i;
+                best_size = hp;
+            } else if (best < 0) {
+                best = (int)i;
+            }
         }
     }
     return best;
+}
+
+static int pick_memtype_device_local(VkPhysicalDevice phys, uint32_t memoryTypeBits) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    return coli_vk_test_pick_memtype_device_local(memoryTypeBits, m.memoryTypeCount, m.memoryTypes, m.memoryHeaps);
 }
 
 static int pick_memtype(VkPhysicalDevice phys) {
@@ -386,6 +400,7 @@ int coli_vk_init(const char *spv_path) {
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
+    pthread_mutex_init(&G.queue_mutex, NULL);
     int mt = pick_memtype(G.phys);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
@@ -463,6 +478,47 @@ int coli_vk_init(const char *spv_path) {
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.fence), "fence");
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
+
+    if (getenv("COLI_VK_STAGED") && atoi(getenv("COLI_VK_STAGED")) != 0) {
+        int staged_ok = 0;
+        if (vkAllocateCommandBuffers(G.dev, &cbi, &G.stage_cmd) == VK_SUCCESS) {
+            if (vkCreateFence(G.dev, &fi, NULL, &G.stage_fence) == VK_SUCCESS) {
+                if (pthread_mutex_init(&G.stage_mutex, NULL) == 0) {
+                    G.stage_cap = 128 * 1024 * 1024; // 128 MB staging buffer
+                    VkBufferCreateInfo sbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                        .size = G.stage_cap, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+                    if (vkCreateBuffer(G.dev, &sbi, NULL, &G.stage_buf) == VK_SUCCESS) {
+                        VkMemoryRequirements req;
+                        vkGetBufferMemoryRequirements(G.dev, G.stage_buf, &req);
+                        VkMemoryAllocateInfo sai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                            .allocationSize = req.size, .memoryTypeIndex = G.memtype};
+                        if (vkAllocateMemory(G.dev, &sai, NULL, &G.stage_mem) == VK_SUCCESS) {
+                            if (vkBindBufferMemory(G.dev, G.stage_buf, G.stage_mem, 0) == VK_SUCCESS) {
+                                if (vkMapMemory(G.dev, G.stage_mem, 0, G.stage_cap, 0, &G.stage_ptr) == VK_SUCCESS) {
+                                    staged_ok = 1;
+                                    G.use_staged = 1;
+                                    fprintf(stderr, "[VK] info: COLI_VK_STAGED active. 128MB staging buffer allocated.\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!staged_ok) {
+            if (G.stage_buf) vkDestroyBuffer(G.dev, G.stage_buf, NULL);
+            if (G.stage_mem) vkFreeMemory(G.dev, G.stage_mem, NULL);
+            if (G.stage_fence) vkDestroyFence(G.dev, G.stage_fence, NULL);
+            G.stage_buf = VK_NULL_HANDLE;
+            G.stage_mem = VK_NULL_HANDLE;
+            G.stage_fence = VK_NULL_HANDLE;
+            G.stage_ptr = NULL;
+            G.use_staged = 0;
+            fprintf(stderr, "[VK] warning: staged upload initialization failed, falling back to CPU/host-visible path.\n");
+        }
+    }
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
@@ -573,18 +629,22 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
 
     if (placement == COLI_VK_DEVICE_LOCAL_STAGED && G.use_staged && G.stage_buf) {
         usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        // Probe required memory type for DEVICE_LOCAL
-        VkBufferCreateInfo dummy_bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        VkBuffer dummy;
-        if (vkCreateBuffer(G.dev, &dummy_bi, NULL, &dummy) == VK_SUCCESS) {
-            VkMemoryRequirements dreq;
-            vkGetBufferMemoryRequirements(G.dev, dummy, &dreq);
-            int dl_mt = pick_memtype_device_local(G.phys, dreq.memoryTypeBits);
+        // Probe required memory type for DEVICE_LOCAL based on actual size
+        VkBufferCreateInfo test_bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = t->wbytes, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer test_buf;
+        if (vkCreateBuffer(G.dev, &test_bi, NULL, &test_buf) == VK_SUCCESS) {
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(G.dev, test_buf, &req);
+            int dl_mt = pick_memtype_device_local(G.phys, req.memoryTypeBits);
             if (dl_mt >= 0) {
                 memtype = (uint32_t)dl_mt;
                 do_stage = 1;
             }
-            vkDestroyBuffer(G.dev, dummy, NULL);
+            vkDestroyBuffer(G.dev, test_buf, NULL);
+        }
+        if (!do_stage) {
+            // Strict requirement failed, clean fallback
+            free(t); return 0;
         }
     }
 
@@ -611,42 +671,56 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
         memcpy((uint8_t *)G.stage_ptr + t->wbytes, scales, sfl * sizeof(float));
 
         // Submit transfer
-        vkResetCommandBuffer(G.stage_cmd, 0);
-        VkCommandBufferBeginInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-        if (vkBeginCommandBuffer(G.stage_cmd, &cbi) == VK_SUCCESS) {
-            VkBufferCopy r_w = {.srcOffset = 0, .dstOffset = 0, .size = t->wbytes};
-            vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->wbuf, 1, &r_w);
-            if (sfl > 0) {
-                VkBufferCopy r_s = {.srcOffset = t->wbytes, .dstOffset = 0, .size = sfl * sizeof(float)};
-                vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->sbuf, 1, &r_s);
-            }
+        int upload_ok = 0;
+        if (vkResetCommandBuffer(G.stage_cmd, 0) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            if (vkBeginCommandBuffer(G.stage_cmd, &cbi) == VK_SUCCESS) {
+                VkBufferCopy r_w = {.srcOffset = 0, .dstOffset = 0, .size = t->wbytes};
+                vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->wbuf, 1, &r_w);
+                if (sfl > 0) {
+                    VkBufferCopy r_s = {.srcOffset = t->wbytes, .dstOffset = 0, .size = sfl * sizeof(float)};
+                    vkCmdCopyBuffer(G.stage_cmd, G.stage_buf, t->sbuf, 1, &r_s);
+                }
 
-            VkBufferMemoryBarrier barriers[2];
-            barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            barriers[0].pNext = NULL;
-            barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[0].buffer = t->wbuf;
-            barriers[0].offset = 0;
-            barriers[0].size = VK_WHOLE_SIZE;
+                VkBufferMemoryBarrier barriers[2];
+                barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[0].pNext = NULL;
+                barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[0].buffer = t->wbuf;
+                barriers[0].offset = 0;
+                barriers[0].size = VK_WHOLE_SIZE;
 
-            barriers[1] = barriers[0];
-            barriers[1].buffer = t->sbuf;
+                barriers[1] = barriers[0];
+                barriers[1].buffer = t->sbuf;
 
-            vkCmdPipelineBarrier(G.stage_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, (sfl>0?2:1), barriers, 0, NULL);
+                vkCmdPipelineBarrier(G.stage_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, (sfl>0?2:1), barriers, 0, NULL);
 
-            if (vkEndCommandBuffer(G.stage_cmd) == VK_SUCCESS) {
-                vkResetFences(G.dev, 1, &G.stage_fence);
-                VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.stage_cmd};
-                if (vkQueueSubmit(G.queue, 1, &si, G.stage_fence) == VK_SUCCESS) {
-                    vkWaitForFences(G.dev, 1, &G.stage_fence, VK_TRUE, 5000000000ULL);
+                if (vkEndCommandBuffer(G.stage_cmd) == VK_SUCCESS) {
+                    if (vkResetFences(G.dev, 1, &G.stage_fence) == VK_SUCCESS) {
+                        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.stage_cmd};
+                        pthread_mutex_lock(&G.queue_mutex);
+                        VkResult res_qs = vkQueueSubmit(G.queue, 1, &si, G.stage_fence);
+                        pthread_mutex_unlock(&G.queue_mutex);
+                        if (res_qs == VK_SUCCESS) {
+                            if (vkWaitForFences(G.dev, 1, &G.stage_fence, VK_TRUE, 5000000000ULL) == VK_SUCCESS) {
+                                upload_ok = 1;
+                            }
+                        }
+                    }
                 }
             }
         }
 
         pthread_mutex_unlock(&G.stage_mutex);
+        if (!upload_ok) {
+            fprintf(stderr, "[VK] error: staged upload transfer failed\n");
+            // Disable staging on hard failure to recover and not leak submissions/timeouts on hot path.
+            G.use_staged = 0;
+            free(t); return 0;
+        }
     } else {
         if (wptr) {
             memset(wptr, 0, t->wbytes);
@@ -765,7 +839,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; g_vsub_ms += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
@@ -824,7 +898,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -928,7 +1002,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
-      VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
+      pthread_mutex_lock(&G.queue_mutex); VkResult _reqs = vkQueueSubmit(G.queue, 1, &si, G.eg_fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_reqs, "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
     G.eg_pending_yb = yb; G.eg_inflight = 1;
     return 1;
@@ -1393,7 +1467,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1452,7 +1526,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1553,7 +1627,7 @@ int coli_vk_attn_qprep(int layer,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1626,7 +1700,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    pthread_mutex_lock(&G.queue_mutex); VkResult _rqs = vkQueueSubmit(G.queue, 1, &si, G.fence); pthread_mutex_unlock(&G.queue_mutex); VKCHECK(_rqs, "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }

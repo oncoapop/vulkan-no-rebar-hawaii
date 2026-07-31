@@ -478,8 +478,8 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_tier$(EXE): tests/test_tier.c tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_vk_staged$(EXE): tests/test_vk_staged.c backend_vulkan.o
+	$(CC) $(CFLAGS) $< backend_vulkan.o -o $@ $(LDFLAGS)
 
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

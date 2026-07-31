@@ -1,16 +1,16 @@
 # CPU Baseline Report
 
-**Environment:**
+**Environment (User-Provided & Pending Host Verification):**
 *   OS: Ubuntu 24.04
-*   CPU: Intel Xeon E5-2699 v3, 12 cores, SMT disabled
+*   CPU: Intel Xeon E5-2699 v3, 18 physical cores, SMT disabled
 *   RAM: 32 GB ECC
 *   Model: GLM-5.2 Colibrì int4 gs64 with int8 MTP head (~372 GB on NVMe)
 
 **Command to execute on Damian's Server:**
-`./colibri --model /path/to/model -t 12 --temp 0 --draft 0 -p "Explain quantum computing."`
+`./colibri --model /path/to/model -t 18 --temp 0 --draft 0 -p "Explain quantum computing."`
 
-**Results:**
-*   **Startup Time:** NOT_RUN (Pending hardware validation)
+**Results (Pending Execution on Damian's Server):**
+*   **Startup Time:** NOT_RUN
 *   **Time to First Token (TTFT):** NOT_RUN
 *   **Prefill Performance:** NOT_RUN
 *   **Decode Performance:** NOT_RUN
