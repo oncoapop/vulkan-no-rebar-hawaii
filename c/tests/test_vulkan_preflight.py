@@ -298,12 +298,12 @@ memoryHeaps: count = 3
 		flags: count = 1
 			MEMORY_HEAP_DEVICE_LOCAL_BIT
 	memoryHeaps[1]:
+		size   = 8589934592 (0x200000000) (8.00 GiB)
+		flags: count = 0
+	memoryHeaps[2]:
 		size   = 268435456 (0x10000000) (256.00 MiB)
 		flags: count = 1
 			MEMORY_HEAP_DEVICE_LOCAL_BIT
-	memoryHeaps[2]:
-		size   = 8589934592 (0x200000000) (8.00 GiB)
-		flags: count = 0
 memoryTypes: count = 7
 	memoryTypes[0]:
 		heapIndex     = 0
@@ -311,29 +311,34 @@ memoryTypes: count = 7
 			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 	memoryTypes[1]:
 		heapIndex     = 1
-		propertyFlags = 0x0001: count = 1
-			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-	memoryTypes[2]:
-		heapIndex     = 2
 		propertyFlags = 0x0006: count = 2
 			MEMORY_PROPERTY_HOST_VISIBLE_BIT
 			MEMORY_PROPERTY_HOST_COHERENT_BIT
-	memoryTypes[3]:
-		heapIndex     = 2
+	memoryTypes[2]:
+		heapIndex     = 1
 		propertyFlags = 0x000e: count = 3
 			MEMORY_PROPERTY_HOST_VISIBLE_BIT
 			MEMORY_PROPERTY_HOST_COHERENT_BIT
 			MEMORY_PROPERTY_HOST_CACHED_BIT
-	memoryTypes[4]:
-		heapIndex     = 0
-		propertyFlags = 0x0001: count = 1
+	memoryTypes[3]:
+		heapIndex     = 2
+		propertyFlags = 0x0007: count = 3
 			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
+	memoryTypes[4]:
+		heapIndex     = 2
+		propertyFlags = 0x0007: count = 3
+			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
 	memoryTypes[5]:
 		heapIndex     = 1
-		propertyFlags = 0x0001: count = 1
-			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+		propertyFlags = 0x0006: count = 2
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
 	memoryTypes[6]:
-		heapIndex     = 2
+		heapIndex     = 1
 		propertyFlags = 0x000e: count = 3
 			MEMORY_PROPERTY_HOST_VISIBLE_BIT
 			MEMORY_PROPERTY_HOST_COHERENT_BIT
@@ -359,18 +364,20 @@ VkPhysicalDeviceFeatures:
         self.assertEqual(len(heaps), 3)
         self.assertEqual(heaps[0]["size"], 8589934592)
         self.assertEqual(heaps[0]["flags"], 1) # DEVICE_LOCAL
-        self.assertEqual(heaps[1]["size"], 268435456)
-        self.assertEqual(heaps[1]["flags"], 1) # DEVICE_LOCAL
-        self.assertEqual(heaps[2]["size"], 8589934592)
-        self.assertEqual(heaps[2]["flags"], 0) # host memory
+        self.assertEqual(heaps[1]["size"], 8589934592)
+        self.assertEqual(heaps[1]["flags"], 0) # host memory
+        self.assertEqual(heaps[2]["size"], 268435456)
+        self.assertEqual(heaps[2]["flags"], 1) # DEVICE_LOCAL BAR
 
         # Verify types
         types = data["selected_device"]["memoryTypes"]
         self.assertEqual(len(types), 7)
-        self.assertEqual(types[2]["heapIndex"], 2)
-        self.assertEqual(types[2]["propertyFlags"], 0x0006)
-        self.assertEqual(types[6]["heapIndex"], 2)
-        self.assertEqual(types[6]["propertyFlags"], 0x000e)
+        self.assertEqual(types[3]["heapIndex"], 2)
+        self.assertEqual(types[4]["heapIndex"], 2)
+        self.assertEqual(types[3]["propertyFlags"], 0x0007)
+        self.assertEqual(types[4]["propertyFlags"], 0x0007)
+        self.assertEqual(types[0]["propertyFlags"], 0x0001)  # DEVICE_LOCAL non-HOST_VISIBLE
+        self.assertEqual(types[1]["propertyFlags"], 0x0006)  # HOST_VISIBLE non-device-local system memory
 
 if __name__ == '__main__':
     unittest.main()
