@@ -15,8 +15,8 @@ def parse_vulkaninfo(output):
     for line in output.splitlines():
         line = line.rstrip()
 
-        # New Device Block
-        dev_match = re.match(r'^Device Properties and Extensions:', line)
+        # New Device Block. vulkaninfo output usually lists GPU0:, GPU1:, etc.
+        dev_match = re.match(r'^GPU\d+:', line)
         if dev_match:
             if current_device is not None:
                 devices.append(current_device)
@@ -28,6 +28,7 @@ def parse_vulkaninfo(output):
                 "memoryHeaps": [],
                 "memoryTypes": []
             }
+            in_memory = False
             continue
 
         if current_device is not None:
@@ -68,6 +69,11 @@ def parse_vulkaninfo(output):
                 if size_m and len(current_device["memoryHeaps"]) > 0:
                     current_device["memoryHeaps"][-1]["size"] = int(size_m.group(1))
 
+                if "MEMORY_HEAP_DEVICE_LOCAL_BIT" in line and len(current_device["memoryHeaps"]) > 0:
+                    current_device["memoryHeaps"][-1]["flags"] |= 1
+                if "MEMORY_HEAP_MULTI_INSTANCE_BIT" in line and len(current_device["memoryHeaps"]) > 0:
+                    current_device["memoryHeaps"][-1]["flags"] |= 2
+
                 type_m = re.match(r'^\s*memoryTypes\[(\d+)\]:', line)
                 if type_m:
                     idx = int(type_m.group(1))
@@ -89,8 +95,6 @@ def parse_vulkaninfo(output):
 
 def detect_vulkan_hawaii():
     try:
-        # Run vulkaninfo
-        # Use full dump because --summary might not have memory info
         result = subprocess.run(["vulkaninfo"], capture_output=True, text=True)
         if result.returncode != 0:
             print("ERROR_PREFLIGHT")
@@ -124,13 +128,23 @@ def detect_vulkan_hawaii():
 
         # Select one Hawaii device
         selected = hawaii_devices[0]
-        selected["benchmarks"] = {
-            "glm_5_2": "NOT_RUN"
+
+        # Verify required memory information
+        if not selected.get("memoryHeaps") or not selected.get("memoryTypes"):
+            print("ERROR_PREFLIGHT")
+            return
+
+        payload = {
+            "selected_device": selected,
+            "hawaii_devices": hawaii_devices,
+            "hawaii_device_count": len(hawaii_devices),
+            "benchmarks": {
+                "glm_5_2": "NOT_RUN"
+            }
         }
 
         print("READY_FOR_HARDWARE_TEST")
-        # Ensure we only output exactly what is needed for the selected device
-        print(json.dumps(selected, indent=2))
+        print(json.dumps(payload, indent=2))
 
     except FileNotFoundError:
         print("ERROR_PREFLIGHT")
