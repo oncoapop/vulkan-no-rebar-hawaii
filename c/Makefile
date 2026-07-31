@@ -220,6 +220,7 @@ TEST_BINS += tests/test_uring$(EXE)
 endif
 
 # Only compile Vulkan tests if Vulkan is actually available
+VULKAN_CFLAGS = $(shell pkg-config --cflags vulkan 2>/dev/null)
 VULKAN_LDFLAGS = $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -570,7 +571,14 @@ test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+	@if ! pkg-config --exists vulkan; then \
+		echo "SKIP: Vulkan development headers not found (pkg-config failed)."; \
+		echo "int main() { printf(\"SKIP: Vulkan unavailable\\\\n\"); return 0; }" > $@.tmp.c; \
+		$(CC) $@.tmp.c -o $@; \
+		rm $@.tmp.c; \
+	else \
+		$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS); \
+	fi
 
 vulkan-test: tests/test_vulkan_staged_upload$(EXE)
 	./tests/test_vulkan_staged_upload$(EXE)
