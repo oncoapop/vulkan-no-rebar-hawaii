@@ -571,17 +571,14 @@ test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
-	@if ! pkg-config --exists vulkan; then \
-		echo "SKIP: Vulkan development headers not found (pkg-config failed)."; \
-		echo "int main() { printf(\"SKIP: Vulkan unavailable\\\\n\"); return 0; }" > $@.tmp.c; \
-		$(CC) $@.tmp.c -o $@; \
-		rm $@.tmp.c; \
-	else \
-		$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS); \
-	fi
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
 
-vulkan-test: tests/test_vulkan_staged_upload$(EXE)
-	./tests/test_vulkan_staged_upload$(EXE)
+vulkan-test:
+	@if ! pkg-config --exists vulkan; then \
+		echo "SKIP: Vulkan development headers/libraries unavailable"; \
+	else \
+		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && ./tests/test_vulkan_staged_upload$(EXE); \
+	fi
 
 test: test-c test-python
 
@@ -642,4 +639,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-test check clean install uninstall bench

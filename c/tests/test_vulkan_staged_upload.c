@@ -20,8 +20,7 @@
     do { \
         if ((res) == VK_TIMEOUT) { \
             fprintf(stderr, "FAIL: %s (timed out)\n", msg); \
-            failed = 1; \
-            goto cleanup; \
+            exit(1); \
         } else if ((res) != VK_SUCCESS) { \
             fprintf(stderr, "FAIL: %s (error %d)\n", msg, res); \
             failed = 1; \
