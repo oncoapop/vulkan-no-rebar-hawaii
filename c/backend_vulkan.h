@@ -102,6 +102,28 @@ typedef struct {
     VkDeviceSize packed_size;
 } ColiVulkanTensorLayout;
 
+/*
+ * Exact host representation of one CPU QT. Source lengths are metadata from
+ * the loader, not values reconstructed by the Vulkan backend's caller.
+ */
+typedef struct {
+    uint32_t fmt;
+    uint64_t I;
+    uint64_t O;
+    uint64_t gs;
+    const void *weights;
+    uint64_t weight_bytes;
+    const void *scales;
+    uint64_t scale_bytes;
+} ColiVulkanQTSpec;
+
+typedef struct {
+    uint64_t scale_count;
+    uint64_t effective_group_size;
+    uint64_t uploaded_scale_bytes;
+    ColiVulkanTensorLayout packed;
+} ColiVulkanQTLayout;
+
 #ifdef COLI_VULKAN_TESTING
 /* Test-only injectable Vulkan entry points. Production always uses Vulkan. */
 typedef struct {
@@ -166,6 +188,16 @@ typedef struct {
 
 typedef struct {
     ColiVulkanTensorLayout layout;
+    uint32_t fmt;
+    uint64_t I;
+    uint64_t O;
+    uint64_t gs;
+    uint64_t scale_count;
+    uint64_t effective_group_size;
+    uint64_t source_weight_bytes;
+    uint64_t source_scale_bytes;
+    uint64_t uploaded_scale_bytes;
+    int compute_eligible;
     VkDeviceSize allocation_size;
     uint32_t memory_type_index;
     uint32_t heap_index;
@@ -187,6 +219,17 @@ ColiVulkanResult coli_vulkan_plan_tensor_layout(
     uint64_t scale_bytes,
     VkDeviceSize alignment,
     ColiVulkanTensorLayout *layout
+);
+
+/*
+ * Pure, allocation-free validation for all CPU QT formats accepted by Phase
+ * 3B (fmt 0 through 6). Format 6 requires its exact four-byte .qs source tag,
+ * but that tag is metadata and is not uploaded as an ordinary scale payload.
+ */
+ColiVulkanResult coli_vulkan_validate_qt_spec(
+    const ColiVulkanQTSpec *spec,
+    VkDeviceSize min_storage_buffer_offset_alignment,
+    ColiVulkanQTLayout *layout
 );
 
 /* Pure strict-memory selector used by allocation and unit tests. */
@@ -227,15 +270,15 @@ ColiVulkanResult coli_vulkan_context_get_memory_properties(
     VkPhysicalDeviceMemoryProperties *properties
 );
 
-#if defined(COLI_VULKAN_INTERNAL) || defined(COLI_VULKAN_TESTING)
+#ifdef COLI_VULKAN_TESTING
 /*
  * Phase 3A raw transport API, visible only to backend internals and tests.
  * It creates one strict-local buffer/allocation, packs already-validated raw
  * weight and scale byte ranges, and uploads through the persistent queue and
  * command pool. It does not validate QT format geometry and MUST NOT be called
- * by the Phase 3B loader. Phase 3B must add a public format-aware entry point
- * that validates fmt, I, O, gs, derived scale count, source lengths, and format
- * eligibility before calling this internal transport function.
+ * by the Phase 3B loader. The public format-aware entry point
+ * coli_vulkan_tensor_create_qt() validates fmt, I, O, gs, derived scale count,
+ * source lengths, and format eligibility before calling the internal transport.
  *
  * TIMEOUT, ERROR, or DEVICE_LOST may be returned with `*tensor` non-NULL after
  * submission. The caller must retain that handle, call
@@ -252,6 +295,19 @@ ColiVulkanResult coli_vulkan_tensor_upload(
     uint64_t timeout_ns
 );
 #endif
+
+/*
+ * Sole production tensor creator. Validation is completed before any Vulkan
+ * object is allocated or any command is submitted. TIMEOUT, ERROR, or
+ * DEVICE_LOST may return a non-NULL tensor exactly as documented for the
+ * retained-operation lifecycle above; callers must retain, finish, and free it.
+ */
+ColiVulkanResult coli_vulkan_tensor_create_qt(
+    ColiVulkanContext *context,
+    ColiVulkanTensor **tensor,
+    const ColiVulkanQTSpec *spec,
+    uint64_t timeout_ns
+);
 
 /*
  * Exact diagnostic readback of the packed tensor bytes. `output` is valid only

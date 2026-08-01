@@ -658,6 +658,158 @@ static void test_config_and_layout(void) {
         COLI_VULKAN_LIMIT_EXCEEDED, "layout overflow");
 }
 
+static void check_valid_qt(
+    uint32_t fmt,
+    uint64_t I,
+    uint64_t O,
+    uint64_t gs,
+    uint64_t weight_bytes,
+    uint64_t scale_bytes,
+    uint64_t scale_count,
+    uint64_t effective_group_size,
+    uint64_t uploaded_scale_bytes
+) {
+    uint8_t weight = 0, scale = 0;
+    ColiVulkanQTSpec spec = {
+        fmt, I, O, gs, &weight, weight_bytes,
+        scale_bytes ? &scale : NULL, scale_bytes
+    };
+    ColiVulkanQTLayout layout;
+    ColiVulkanResult result = coli_vulkan_validate_qt_spec(&spec, 256, &layout);
+    if (result != COLI_VULKAN_OK || layout.scale_count != scale_count ||
+        layout.effective_group_size != effective_group_size ||
+        layout.uploaded_scale_bytes != uploaded_scale_bytes ||
+        layout.packed.weight_size != weight_bytes ||
+        layout.packed.scale_size != uploaded_scale_bytes ||
+        layout.packed.weight_offset != 0 ||
+        (uploaded_scale_bytes && layout.packed.scale_offset % 256 != 0) ||
+        layout.packed.packed_size % 256 != 0) {
+        fprintf(stderr, "FAIL: %s:%d: valid fmt=%u I=%" PRIu64
+            " O=%" PRIu64 " gs=%" PRIu64 " layout mismatch (%s)\n",
+            __func__, __LINE__, fmt, I, O, gs,
+            coli_vulkan_result_string(result));
+        g_failures++;
+    }
+}
+
+static void test_qt_format_validation(void) {
+    check_valid_qt(0, 17, 3, 0, 204, 0, 0, 0, 0);
+    check_valid_qt(0, 16, 2, 0, 128, 0, 0, 0, 0);
+    check_valid_qt(1, 17, 3, 0, 51, 12, 3, 0, 12);
+    check_valid_qt(1, 16, 2, 0, 32, 8, 2, 0, 8);
+    check_valid_qt(2, 17, 3, 0, 27, 12, 3, 0, 12);
+    check_valid_qt(2, 16, 2, 0, 16, 8, 2, 0, 8);
+    check_valid_qt(3, 17, 3, 0, 15, 12, 3, 0, 12);
+    check_valid_qt(3, 16, 2, 0, 8, 8, 2, 0, 8);
+    check_valid_qt(4, 33, 3, 16, 51, 36, 9, 16, 36);
+    check_valid_qt(4, 64, 2, 32, 64, 16, 4, 32, 16);
+    check_valid_qt(5, 65, 3, 0, 144, 24, 6, 64, 24);
+    check_valid_qt(5, 64, 2, 0, 48, 8, 2, 64, 8);
+    check_valid_qt(6, 257, 3, 0, 588, 4, 0, 256, 0);
+    check_valid_qt(6, 256, 2, 0, 196, 4, 0, 256, 0);
+
+    static const uint64_t groups[] = {16, 32, 48, 64, 96, 128, 192, 256};
+    uint8_t weight = 0, scale = 0;
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+        uint64_t gs = groups[i], I = 257, O = 2;
+        uint64_t wb = O * ((I + 1) / 2);
+        uint64_t sc = O * (I / gs + (I % gs != 0));
+        ColiVulkanQTSpec spec = {4, I, O, gs, &weight, wb, &scale, sc * 4};
+        ColiVulkanQTLayout layout;
+        CHECK_RESULT(coli_vulkan_validate_qt_spec(&spec, 256, &layout),
+            COLI_VULKAN_OK, "supported grouped-int4 size");
+        CHECK(layout.scale_count == sc && layout.effective_group_size == gs,
+            "grouped-int4 derived metadata");
+    }
+
+    ColiVulkanQTLayout layout;
+    ColiVulkanQTSpec bad = {7, 16, 2, 0, &weight, 16, &scale, 8};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_UNSUPPORTED, "unknown format");
+    bad = (ColiVulkanQTSpec){4, 33, 3, 0, &weight, 51, &scale, 36};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_UNSUPPORTED, "grouped format requires group size");
+    bad.gs = 24;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_UNSUPPORTED, "unsupported group size");
+    bad.gs = 48;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_UNSUPPORTED, "group size over I");
+    bad = (ColiVulkanQTSpec){2, 17, 3, 1, &weight, 27, &scale, 12};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_UNSUPPORTED, "row format rejects gs");
+    bad.gs = 0;
+    bad.weight_bytes--;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "short weight source");
+    bad.weight_bytes += 2;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "long weight source");
+    bad.weight_bytes = 27;
+    bad.scale_bytes--;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "short scale source");
+    bad.scale_bytes += 2;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "long scale source");
+    bad = (ColiVulkanQTSpec){6, 256, 2, 0, &weight, 196, &scale, 3};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "format-6 tag too short");
+    bad.scale_bytes = 5;
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "format-6 tag too long");
+    bad = (ColiVulkanQTSpec){0, 1, 1, 0, &weight, 4, &scale, 0};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "scale pointer without scale source");
+    bad = (ColiVulkanQTSpec){0, UINT64_MAX, 2, 0, &weight, 1, NULL, 0};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 256, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "geometry exceeds CPU int range");
+    bad = (ColiVulkanQTSpec){0, 1, 1, 0, &weight, 4, NULL, 0};
+    CHECK_RESULT(coli_vulkan_validate_qt_spec(&bad, 0, &layout),
+        COLI_VULKAN_INVALID_ARGUMENT, "zero storage alignment");
+
+    fake_reset();
+    ColiVulkanConfig config = fake_config(64ULL * 1024ULL * 1024ULL);
+    ColiVulkanContext *context = NULL;
+    ColiVulkanTensor *tensor = NULL;
+    CHECK_RESULT(coli_vulkan_context_create(&context, &config), COLI_VULKAN_OK,
+        "validation counter context");
+    unsigned buffers = g_fake.create_buffer_count;
+    unsigned allocations = g_fake.allocate_memory_count;
+    unsigned commands = g_fake.allocate_command_buffer_count;
+    unsigned fences = g_fake.create_fence_count;
+    unsigned submits = g_fake.queue_submit_count;
+    bad = (ColiVulkanQTSpec){2, 17, 3, 0, &weight, 26, &scale, 12};
+    CHECK_RESULT(coli_vulkan_tensor_create_qt(context, &tensor, &bad,
+        TEST_TIMEOUT_NS), COLI_VULKAN_INVALID_ARGUMENT,
+        "creator rejects before Vulkan work");
+    CHECK(!tensor && buffers == g_fake.create_buffer_count &&
+        allocations == g_fake.allocate_memory_count &&
+        commands == g_fake.allocate_command_buffer_count &&
+        fences == g_fake.create_fence_count && submits == g_fake.queue_submit_count,
+        "validator rejection allocated or submitted");
+
+    uint8_t weights[51] = {0};
+    float scales[9] = {0};
+    ColiVulkanQTSpec good = {4, 33, 3, 16, weights, sizeof(weights),
+        scales, sizeof(scales)};
+    CHECK_RESULT(coli_vulkan_tensor_create_qt(context, &tensor, &good,
+        TEST_TIMEOUT_NS), COLI_VULKAN_OK, "validated creator");
+    ColiVulkanTensorInfo info;
+    CHECK_RESULT(coli_vulkan_tensor_get_info(tensor, &info), COLI_VULKAN_OK,
+        "validated metadata info");
+    CHECK(info.fmt == 4 && info.I == 33 && info.O == 3 && info.gs == 16 &&
+        info.scale_count == 9 && info.effective_group_size == 16 &&
+        info.source_weight_bytes == sizeof(weights) &&
+        info.source_scale_bytes == sizeof(scales) &&
+        info.uploaded_scale_bytes == sizeof(scales) && !info.compute_eligible,
+        "persisted validated metadata");
+    CHECK_RESULT(coli_vulkan_tensor_free(context, &tensor), COLI_VULKAN_OK,
+        "validated tensor free");
+    CHECK_RESULT(coli_vulkan_context_destroy(&context, TEST_TIMEOUT_NS),
+        COLI_VULKAN_OK, "validated context destroy");
+}
+
 static void test_memory_selector(void) {
     VkPhysicalDeviceMemoryProperties properties;
     fill_memory_properties(&properties);
@@ -1067,6 +1219,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     test_config_and_layout();
+    test_qt_format_validation();
     test_memory_selector();
     test_device_selection_and_partial_init();
     test_success_lifecycle();

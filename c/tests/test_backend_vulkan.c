@@ -6,8 +6,12 @@
 #include <string.h>
 
 #define FENCE_TIMEOUT_NS 5000000000ULL
-#define TEST_WEIGHT_BYTES 4093u
-#define TEST_SCALE_BYTES 513u
+
+typedef struct {
+    uint32_t fmt;
+    uint64_t I, O, gs;
+    uint64_t weight_bytes, scale_bytes, scale_count, uploaded_scale_bytes;
+} HardwareCase;
 
 static int fail_result(const char *what, ColiVulkanResult result) {
     fprintf(stderr, "FAIL: %s: %s\n", what, coli_vulkan_result_string(result));
@@ -112,22 +116,43 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (unsigned iteration = 0; iteration < 3; iteration++) {
-        uint8_t weights[TEST_WEIGHT_BYTES];
-        uint8_t scales[TEST_SCALE_BYTES];
-        for (size_t i = 0; i < sizeof(weights); i++)
+    static const HardwareCase cases[] = {
+        {0, 17, 3, 0, 204, 0, 0, 0},
+        {1, 17, 3, 0, 51, 12, 3, 12},
+        {2, 17, 3, 0, 27, 12, 3, 12},
+        {3, 17, 3, 0, 15, 12, 3, 12},
+        {4, 33, 3, 16, 51, 36, 9, 36},
+        {5, 65, 3, 0, 144, 24, 6, 24},
+        {6, 257, 3, 0, 588, 4, 0, 0}
+    };
+    for (unsigned iteration = 0;
+         iteration < sizeof(cases) / sizeof(cases[0]); iteration++) {
+        const HardwareCase *test = &cases[iteration];
+        uint8_t *weights = malloc((size_t)test->weight_bytes);
+        uint8_t *scales = test->scale_bytes
+            ? malloc((size_t)test->scale_bytes) : NULL;
+        if (!weights || (test->scale_bytes && !scales)) {
+            fprintf(stderr, "FAIL: format fixture allocation\n");
+            free(weights); free(scales); failed = 1; goto cleanup;
+        }
+        for (size_t i = 0; i < (size_t)test->weight_bytes; i++)
             weights[i] = (uint8_t)((i * 29u + iteration * 17u) & 0xffu);
-        for (size_t i = 0; i < sizeof(scales); i++)
+        for (size_t i = 0; i < (size_t)test->scale_bytes; i++)
             scales[i] = (uint8_t)((i * 13u + iteration * 31u) & 0xffu);
 
         ColiVulkanTensor *tensor = NULL;
-        result = coli_vulkan_tensor_upload(context, &tensor, weights,
-            sizeof(weights), scales, sizeof(scales), FENCE_TIMEOUT_NS);
+        ColiVulkanQTSpec spec = {
+            test->fmt, test->I, test->O, test->gs, weights,
+            test->weight_bytes, scales, test->scale_bytes
+        };
+        result = coli_vulkan_tensor_create_qt(context, &tensor, &spec,
+            FENCE_TIMEOUT_NS);
         if (result == COLI_VULKAN_TIMEOUT && tensor) {
             result = coli_vulkan_finish_pending(context, FENCE_TIMEOUT_NS);
         }
         if (result != COLI_VULKAN_OK || !tensor) {
             failed = fail_result("tensor upload", result);
+            free(weights); free(scales);
             goto cleanup;
         }
 
@@ -136,10 +161,18 @@ int main(int argc, char **argv) {
         if (result != COLI_VULKAN_OK) {
             failed = fail_result("tensor info", result);
             (void)coli_vulkan_tensor_free(context, &tensor);
+            free(weights); free(scales);
             goto cleanup;
         }
         VkDeviceSize alignment = context_info.min_storage_buffer_offset_alignment;
         if (tensor_info.state != COLI_VULKAN_TENSOR_READY ||
+            tensor_info.fmt != test->fmt || tensor_info.I != test->I ||
+            tensor_info.O != test->O || tensor_info.gs != test->gs ||
+            tensor_info.scale_count != test->scale_count ||
+            tensor_info.source_weight_bytes != test->weight_bytes ||
+            tensor_info.source_scale_bytes != test->scale_bytes ||
+            tensor_info.uploaded_scale_bytes != test->uploaded_scale_bytes ||
+            tensor_info.compute_eligible ||
             tensor_info.layout.weight_offset % alignment != 0 ||
             tensor_info.layout.scale_offset % alignment != 0 ||
             !(tensor_info.memory_property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
@@ -148,12 +181,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: tensor layout or strict-local placement is invalid\n");
             failed = 1;
             (void)coli_vulkan_tensor_free(context, &tensor);
+            free(weights); free(scales);
             goto cleanup;
         }
-        printf("tensor[%u] packed=%" PRIu64 " allocation=%" PRIu64
+        printf("tensor[fmt=%u] packed=%" PRIu64 " allocation=%" PRIu64
                " weightOffset=%" PRIu64 " scaleOffset=%" PRIu64
                " memoryType=%u heap=%u flags=0x%04x\n",
-            iteration, (uint64_t)tensor_info.layout.packed_size,
+            test->fmt, (uint64_t)tensor_info.layout.packed_size,
             (uint64_t)tensor_info.allocation_size,
             (uint64_t)tensor_info.layout.weight_offset,
             (uint64_t)tensor_info.layout.scale_offset,
@@ -165,6 +199,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: readback allocation\n");
             failed = 1;
             (void)coli_vulkan_tensor_free(context, &tensor);
+            free(weights); free(scales);
             goto cleanup;
         }
         memset(readback, 0xa5, (size_t)tensor_info.layout.packed_size);
@@ -180,19 +215,23 @@ int main(int argc, char **argv) {
             failed = fail_result("tensor readback", result);
             free(readback);
             (void)coli_vulkan_tensor_free(context, &tensor);
+            free(weights); free(scales);
             goto cleanup;
         }
         if (memcmp(readback + tensor_info.layout.weight_offset, weights,
-                sizeof(weights)) != 0 ||
-            memcmp(readback + tensor_info.layout.scale_offset, scales,
-                sizeof(scales)) != 0) {
+                (size_t)test->weight_bytes) != 0 ||
+            (test->uploaded_scale_bytes &&
+             memcmp(readback + tensor_info.layout.scale_offset, scales,
+                (size_t)test->uploaded_scale_bytes) != 0)) {
             fprintf(stderr, "FAIL: exact packed byte readback mismatch\n");
             failed = 1;
             free(readback);
             (void)coli_vulkan_tensor_free(context, &tensor);
+            free(weights); free(scales);
             goto cleanup;
         }
         free(readback);
+        free(weights); free(scales);
 
         result = coli_vulkan_tensor_free(context, &tensor);
         if (result != COLI_VULKAN_OK || tensor) {
@@ -216,6 +255,6 @@ cleanup:
             coli_vulkan_result_string(result));
         failed = 1;
     }
-    if (!failed) printf("PASS: persistent Vulkan Phase 3A hardware lifecycle\n");
+    if (!failed) printf("PASS: persistent Vulkan Phase 3B validated QT hardware lifecycle\n");
     return failed ? 1 : 0;
 }

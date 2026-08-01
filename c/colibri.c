@@ -70,6 +70,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+#endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
 #include <omp.h>
@@ -112,8 +115,12 @@ typedef struct {
  * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    uint64_t weight_bytes, scale_bytes;          /* exact host source/view lengths */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
+#endif
+#ifdef COLI_VULKAN
+    ColiVulkanTensor *vulkan;                    /* upload-only residency; never compute eligibility */
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
@@ -198,6 +205,12 @@ typedef struct {
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
+#ifdef COLI_VULKAN
+    ColiVulkanContext *vulkan_context;
+    uint64_t vulkan_timeout_ns;
+    uint32_t vulkan_expert_count, vulkan_tensor_count;
+    int vulkan_requested, vulkan_startup_failed;
+#endif
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
     uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
@@ -283,6 +296,11 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
+#ifdef COLI_VULKAN
+static int g_vulkan_requested;
+static ColiVulkanContext *g_vulkan_exit_context;
+static uint64_t g_vulkan_exit_timeout_ns;
+#endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -850,14 +868,23 @@ static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can l
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
+static void qt_set_source_lengths(QT *t, uint64_t weight_bytes, uint64_t scale_bytes){
+    t->weight_bytes=weight_bytes; t->scale_bytes=scale_bytes;
+}
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
-    if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
-    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
-    else if(bits>=4){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
+    t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    if(bits>=16){ t->fmt=0; qt_set_source_lengths(t,(uint64_t)O*(uint64_t)I*4,0);
+                  t->qf=falloc((int64_t)O*I); }
+    else if(bits>=5 || g_nopack){ t->fmt=1; qt_set_source_lengths(t,(uint64_t)O*(uint64_t)I,(uint64_t)O*4);
+                                  t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
+    else if(bits>=4){ t->fmt=2; qt_set_source_lengths(t,(uint64_t)O*(uint64_t)((I+1)/2),(uint64_t)O*4);
+                      t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
     else if(bits==3){ t->fmt=5; t->q4=qalloc((int64_t)O*i3_rowbytes(I));
-                      t->s=(float*)qalloc((size_t)O*i3_groups(I)*sizeof(float)); }
-    else { t->fmt=3; t->q4=qalloc((int64_t)O*((I+3)/4)); t->s=qsalloc(O); }
+                      t->s=(float*)qalloc((size_t)O*i3_groups(I)*sizeof(float));
+                      qt_set_source_lengths(t,(uint64_t)O*(uint64_t)i3_rowbytes(I),
+                                            (uint64_t)O*(uint64_t)i3_groups(I)*4); }
+    else { t->fmt=3; qt_set_source_lengths(t,(uint64_t)O*(uint64_t)((I+3)/4),(uint64_t)O*4);
+           t->q4=qalloc((int64_t)O*((I+3)/4)); t->s=qsalloc(O); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
@@ -1107,6 +1134,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
                         fmt==6 ? (int64_t)1               : (int64_t)O, drop);
+        t->fmt=fmt; t->O=O; t->I=I; t->gs=gs;
+        qt_set_source_lengths(t,(uint64_t)nb,(uint64_t)ns);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -1565,6 +1594,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+                qt_set_source_lengths(qt[k],(uint64_t)tw[k]->nbytes,(uint64_t)tq[k]->nbytes);
             }
             /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
              * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
@@ -1726,6 +1756,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+        qt_set_source_lengths(qt[k],(uint64_t)tw[k]->nbytes,(uint64_t)tq[k]->nbytes);
     }
     s->eid=eid; return 0;
 }
@@ -1920,6 +1951,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
+        qt_set_source_lengths(qt[k],(uint64_t)l->tw[k]->nbytes,(uint64_t)l->tq[k]->nbytes);
     }
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
@@ -6391,6 +6423,207 @@ static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
 
+#ifdef COLI_VULKAN
+static ColiVulkanQTSpec qt_vulkan_spec(const QT *t){
+    const void *weights=t->fmt==0?(const void*)t->qf:
+                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+    ColiVulkanQTSpec spec={
+        (uint32_t)t->fmt,(uint64_t)t->I,(uint64_t)t->O,(uint64_t)t->gs,
+        weights,t->weight_bytes,t->s,t->scale_bytes
+    };
+    return spec;
+}
+
+static ColiVulkanResult qt_vulkan_release(Model *m, QT *t){
+    if(!t->vulkan) return COLI_VULKAN_OK;
+    return coli_vulkan_tensor_free(m->vulkan_context,&t->vulkan);
+}
+
+static ColiVulkanResult vulkan_release_local(
+    Model *m, ColiVulkanTensor **tensor
+){
+    if(!*tensor) return COLI_VULKAN_OK;
+    ColiVulkanResult result=coli_vulkan_tensor_free(m->vulkan_context,tensor);
+    if(result==COLI_VULKAN_BUSY)
+        result=coli_vulkan_finish_pending(m->vulkan_context,m->vulkan_timeout_ns);
+    return result;
+}
+
+static ColiVulkanResult vulkan_rollback_triplet(
+    Model *m, ColiVulkanTensor *tensor[3], ColiVulkanResult original
+){
+    ColiVulkanResult cleanup=COLI_VULKAN_OK;
+    for(int k=2;k>=0;k--){
+        ColiVulkanResult result=vulkan_release_local(m,&tensor[k]);
+        if(result!=COLI_VULKAN_OK && cleanup==COLI_VULKAN_OK) cleanup=result;
+    }
+    if(cleanup==COLI_VULKAN_DEVICE_LOST || cleanup==COLI_VULKAN_TIMEOUT ||
+       cleanup==COLI_VULKAN_ERROR) return cleanup;
+    return original;
+}
+
+static int vulkan_tensor_matches(
+    const QT *qt, const ColiVulkanQTLayout *layout,
+    const ColiVulkanTensorInfo *info
+){
+    return info->state==COLI_VULKAN_TENSOR_READY &&
+           info->fmt==(uint32_t)qt->fmt && info->I==(uint64_t)qt->I &&
+           info->O==(uint64_t)qt->O && info->gs==(uint64_t)qt->gs &&
+           info->scale_count==layout->scale_count &&
+           info->effective_group_size==layout->effective_group_size &&
+           info->source_weight_bytes==qt->weight_bytes &&
+           info->source_scale_bytes==qt->scale_bytes &&
+           info->uploaded_scale_bytes==layout->uploaded_scale_bytes &&
+           !info->compute_eligible &&
+           (info->memory_property_flags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+           !(info->memory_property_flags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+}
+
+static ColiVulkanResult expert_vulkan_upload_triplet(Model *m, ESlot *s){
+    if(!m||!m->vulkan_context||!s||s->g.vulkan||s->u.vulkan||s->d.vulkan)
+        return COLI_VULKAN_INVALID_ARGUMENT;
+    QT *qt[3]={&s->g,&s->u,&s->d};
+    ColiVulkanQTSpec spec[3]; ColiVulkanQTLayout layout[3];
+    ColiVulkanContextInfo context_info;
+    ColiVulkanResult result=coli_vulkan_context_get_info(m->vulkan_context,&context_info);
+    if(result!=COLI_VULKAN_OK) return result;
+    VkDeviceSize alignment=context_info.min_storage_buffer_offset_alignment;
+    if(!alignment) alignment=1;
+    for(int k=0;k<3;k++){
+        spec[k]=qt_vulkan_spec(qt[k]);
+        result=coli_vulkan_validate_qt_spec(&spec[k],alignment,&layout[k]);
+        if(result!=COLI_VULKAN_OK) return result;   /* all validation precedes allocation */
+    }
+
+    ColiVulkanTensor *local[3]={NULL,NULL,NULL};
+    for(int k=0;k<3;k++){
+        result=coli_vulkan_tensor_create_qt(m->vulkan_context,&local[k],&spec[k],
+                                             m->vulkan_timeout_ns);
+        if(result!=COLI_VULKAN_OK)
+            return vulkan_rollback_triplet(m,local,result);
+        ColiVulkanTensorInfo info;
+        result=coli_vulkan_tensor_get_info(local[k],&info);
+        if(result!=COLI_VULKAN_OK || !vulkan_tensor_matches(qt[k],&layout[k],&info))
+            return vulkan_rollback_triplet(m,local,
+                result==COLI_VULKAN_OK?COLI_VULKAN_ERROR:result);
+    }
+    result=coli_vulkan_context_get_info(m->vulkan_context,&context_info);
+    if(result!=COLI_VULKAN_OK || !context_info.usable || context_info.device_lost ||
+       context_info.pending_operations)
+        return vulkan_rollback_triplet(m,local,
+            result==COLI_VULKAN_OK?COLI_VULKAN_ERROR:result);
+
+    /* Startup is single-threaded here: publish the complete expert in one block. */
+    s->g.vulkan=local[0]; s->u.vulkan=local[1]; s->d.vulkan=local[2];
+    m->vulkan_expert_count++; m->vulkan_tensor_count+=3;
+    return COLI_VULKAN_OK;
+}
+
+static void pin_vulkan_upload_prefix(
+    Model *m, const PinRec *records, const int *slot_of, int npin
+){
+    for(int a=0;a<npin;a++){
+        ColiVulkanContextInfo info;
+        ColiVulkanResult result=coli_vulkan_context_get_info(m->vulkan_context,&info);
+        if(result!=COLI_VULKAN_OK){ m->vulkan_startup_failed=1; return; }
+        /* Three persistent allocations plus one transient staging allocation. */
+        if(info.max_memory_allocation_count<4 ||
+           info.live_allocations>info.max_memory_allocation_count-4)
+            result=COLI_VULKAN_LIMIT_EXCEEDED;
+        else {
+            ESlot *slot=&m->pin[records[a].l][slot_of[a]];
+            result=expert_vulkan_upload_triplet(m,slot);
+        }
+        if(result==COLI_VULKAN_OK) continue;
+        if(result==COLI_VULKAN_LIMIT_EXCEEDED && m->vulkan_expert_count>0) break;
+        fprintf(stderr,"[VULKAN] startup expert upload failed at layer=%d expert=%d: %s\n",
+                records[a].l,records[a].e,coli_vulkan_result_string(result));
+        m->vulkan_startup_failed=1; return;
+    }
+}
+
+static int vulkan_finalize_startup(Model *m){
+    if(!m->vulkan_requested) return 1;
+    if(m->vulkan_startup_failed || m->vulkan_expert_count==0){
+        fprintf(stderr,"[VULKAN] requested residency produced no valid expert tier\n");
+        return 0;
+    }
+    ColiVulkanContextInfo info;
+    if(coli_vulkan_context_get_info(m->vulkan_context,&info)!=COLI_VULKAN_OK ||
+       !info.usable || info.device_lost || info.pending_operations ||
+       info.vendor_id!=COLI_VULKAN_VENDOR_ID || info.device_id!=COLI_VULKAN_DEVICE_ID ||
+       info.live_tensors!=m->vulkan_tensor_count ||
+       m->vulkan_tensor_count!=3*m->vulkan_expert_count){
+        fprintf(stderr,"[VULKAN] residency accounting/state validation failed\n");
+        return 0;
+    }
+    uint32_t seen=0;
+    for(int l=0;l<=m->c.n_layers;l++) for(int z=0;z<m->npin[l];z++){
+        QT *qt[3]={&m->pin[l][z].g,&m->pin[l][z].u,&m->pin[l][z].d};
+        for(int k=0;k<3;k++) if(qt[k]->vulkan){
+            ColiVulkanTensorInfo ti;
+            if(coli_vulkan_tensor_get_info(qt[k]->vulkan,&ti)!=COLI_VULKAN_OK ||
+               ti.state!=COLI_VULKAN_TENSOR_READY ||
+               !(ti.memory_property_flags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+               (ti.memory_property_flags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)){
+                fprintf(stderr,"[VULKAN] published tensor failed READY/strict-local validation\n");
+                return 0;
+            }
+            seen++;
+        }
+    }
+    if(seen!=m->vulkan_tensor_count){
+        fprintf(stderr,"[VULKAN] published tensor count mismatch\n"); return 0;
+    }
+    fprintf(stderr,"[VULKAN] READY upload-only: vendor=0x%04x device=0x%04x "
+            "experts=%u tensors=%u committed=%llu budget=%llu pending=0 "
+            "compute=CPU host_copies=retained\n",
+            info.vendor_id,info.device_id,m->vulkan_expert_count,m->vulkan_tensor_count,
+            (unsigned long long)info.committed_bytes,
+            (unsigned long long)info.effective_budget_bytes);
+    return 1;
+}
+
+static ColiVulkanResult model_vulkan_release(Model *m){
+    if(!m||!m->vulkan_context) return COLI_VULKAN_OK;
+    ColiVulkanResult first=COLI_VULKAN_OK;
+    for(int l=0;l<=m->c.n_layers;l++) for(int z=0;z<m->npin[l];z++){
+        QT *qt[3]={&m->pin[l][z].g,&m->pin[l][z].u,&m->pin[l][z].d};
+        for(int k=0;k<3;k++){
+            ColiVulkanResult result=qt_vulkan_release(m,qt[k]);
+            if(result==COLI_VULKAN_BUSY)
+                result=coli_vulkan_finish_pending(m->vulkan_context,m->vulkan_timeout_ns);
+            if(result!=COLI_VULKAN_OK && first==COLI_VULKAN_OK) first=result;
+        }
+    }
+    ColiVulkanContextInfo info;
+    if(coli_vulkan_context_get_info(m->vulkan_context,&info)==COLI_VULKAN_OK &&
+       info.pending_operations){
+        ColiVulkanResult result=coli_vulkan_finish_pending(m->vulkan_context,
+                                                           m->vulkan_timeout_ns);
+        if(result!=COLI_VULKAN_OK && first==COLI_VULKAN_OK) first=result;
+    }
+    if(first==COLI_VULKAN_TIMEOUT || first==COLI_VULKAN_ERROR ||
+       first==COLI_VULKAN_DEVICE_LOST) return first;
+    ColiVulkanResult result=coli_vulkan_context_destroy(&m->vulkan_context,
+                                                        m->vulkan_timeout_ns);
+    if(result==COLI_VULKAN_OK){
+        g_vulkan_exit_context=NULL;
+        m->vulkan_expert_count=0; m->vulkan_tensor_count=0;
+    }
+    return result;
+}
+
+static void vulkan_exit_cleanup(void){
+    if(!g_vulkan_exit_context) return;
+    ColiVulkanResult result=coli_vulkan_context_destroy(&g_vulkan_exit_context,
+                                                        g_vulkan_exit_timeout_ns);
+    if(result!=COLI_VULKAN_OK)
+        fprintf(stderr,"[VULKAN] bounded exit cleanup retained resources: %s\n",
+                coli_vulkan_result_string(result));
+}
+#endif
+
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
  * per slab. Per-slab policies cost ~2 unmergeable VMAs each; a PIN_GB=all load
@@ -6538,6 +6771,10 @@ static void pin_load(Model *m, const char *statspath, double gb){
     g_numa_skip_bind=0;
 #endif
     m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
+#ifdef COLI_VULKAN
+    if(m->vulkan_requested)
+        pin_vulkan_upload_prefix(m,r,slot_of,npin);
+#endif
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
         int gpu_limit=gpu_prefix?gpu_prefix:npin;
@@ -6792,6 +7029,10 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
 #ifdef COLI_METAL
     if(g_metal_enabled) backend="Metal";
 #endif
+#ifdef COLI_VULKAN
+    if(m->vulkan_requested&&m->vulkan_expert_count)
+        backend="CPU + Vulkan residency (upload-only)";
+#endif
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
     int pinned=0; for(int i=0;i<=c->n_layers;i++) if(m->npin) pinned+=m->npin[i];
@@ -6874,6 +7115,22 @@ int main(int argc, char **argv){
 #ifdef _WIN32
     _setmode(fileno(stdout), O_BINARY);
 #endif
+#ifdef COLI_VULKAN
+    ColiVulkanConfig vulkan_config; memset(&vulkan_config,0,sizeof(vulkan_config));
+#endif
+    { const char *request=getenv("COLI_VULKAN");
+      if(request&&*request&&strcmp(request,"0")&&strcmp(request,"1")){
+          fprintf(stderr,"COLI_VULKAN must be exactly 0 or 1\n"); return 2;
+      }
+#ifdef COLI_VULKAN
+      g_vulkan_requested=request&&!strcmp(request,"1");
+#else
+      if(request&&!strcmp(request,"1")){
+          fprintf(stderr,"Vulkan was requested, but this binary is CPU-only; rebuild with: make VULKAN=1\n");
+          return 2;
+      }
+#endif
+    }
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;
     if(getenv("I4_ACC512_TEST")){
@@ -7012,6 +7269,33 @@ int main(int argc, char **argv){
         else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
     }
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+#ifdef COLI_VULKAN
+    if(g_vulkan_requested){
+        if((getenv("COLI_CUDA")&&atoi(getenv("COLI_CUDA"))) ||
+           getenv("COLI_GPU") || getenv("COLI_GPUS") ||
+           (getenv("COLI_METAL")&&atoi(getenv("COLI_METAL")))){
+            fprintf(stderr,"COLI_VULKAN=1 cannot be combined with CUDA, HIP, or Metal runtime settings\n");
+            return 2;
+        }
+        if(g_repin>0){ fprintf(stderr,"COLI_VULKAN=1 requires REPIN=0\n"); return 2; }
+        uint64_t timeout_ms=5000;
+        const char *timeout=getenv("VULKAN_TIMEOUT_MS");
+        if(timeout&&*timeout){
+            errno=0; char *end=NULL; unsigned long long value=strtoull(timeout,&end,10);
+            if(errno||end==timeout||*end||value<1||value>60000){
+                fprintf(stderr,"VULKAN_TIMEOUT_MS must be an integer from 1 through 60000\n");
+                return 2;
+            }
+            timeout_ms=(uint64_t)value;
+        }
+        ColiVulkanResult result=coli_vulkan_config_from_env(&vulkan_config,
+                                                            timeout_ms*1000000ULL);
+        if(result!=COLI_VULKAN_OK){
+            fprintf(stderr,"COLI_VULKAN=1 requires an explicit positive integer VULKAN_EXPERT_MB\n");
+            return 2;
+        }
+    }
+#endif
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
@@ -7115,6 +7399,30 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    int exit_status=0;
+#ifdef COLI_VULKAN
+    m.vulkan_requested=g_vulkan_requested;
+    if(g_vulkan_requested){
+        m.vulkan_timeout_ns=vulkan_config.upload_timeout_ns;
+        ColiVulkanResult result=coli_vulkan_context_create(&m.vulkan_context,&vulkan_config);
+        if(result!=COLI_VULKAN_OK){
+            fprintf(stderr,"[VULKAN] persistent context creation failed: %s\n",
+                    coli_vulkan_result_string(result));
+            return 2;
+        }
+        g_vulkan_exit_context=m.vulkan_context;
+        g_vulkan_exit_timeout_ns=m.vulkan_timeout_ns;
+        if(atexit(vulkan_exit_cleanup)!=0){
+            fprintf(stderr,"[VULKAN] failed to register bounded exit cleanup\n");
+            result=coli_vulkan_context_destroy(&m.vulkan_context,m.vulkan_timeout_ns);
+            g_vulkan_exit_context=m.vulkan_context;
+            if(result!=COLI_VULKAN_OK)
+                fprintf(stderr,"[VULKAN] cleanup after registration failure retained resources: %s\n",
+                        coli_vulkan_result_string(result));
+            return 2;
+        }
+    }
+#endif
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8
          * tokens' worth of routing) is a measured-config constant, not a derived truth.
@@ -7236,18 +7544,24 @@ int main(int argc, char **argv){
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx);
+#ifdef COLI_VULKAN
+      if(g_vulkan_requested&&!vulkan_finalize_startup(&m)){
+          exit_status=2; goto model_cleanup;
+      }
+#endif
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
-    if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); goto model_cleanup; }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
     if(getenv("SERVE")){
         if(getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"))) run_serve_mux(&m,snap);
         else run_serve(&m,snap);
-        if(stats) stats_dump(&m,stats); return 0;
+        if(stats) stats_dump(&m,stats);
+        goto model_cleanup;
     }
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
@@ -7256,16 +7570,16 @@ int main(int argc, char **argv){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
         run_text(&m, snap, user_prompt, ngen);
         if(stats) stats_dump(&m,stats);
-        return 0;
+        goto model_cleanup;
     }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
     char *b=cfg_slurp(refpath);
-    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); return 1; }
+    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); exit_status=1; goto model_cleanup; }
     char *ar=NULL; jval *ref=json_parse(b,&ar);
     int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
-    if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
+    if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); exit_status=1; goto model_cleanup; }
     int n_new=nfull-np;
     /* L'oracolo (ref_glm.json in repo) e' del modello TINY: contro il 744B da' 0/20
      * garantito su OGNI piattaforma (prompt-token tiny = spazzatura per il modello vero).
@@ -7283,13 +7597,13 @@ int main(int argc, char **argv){
           "  Nessun PROMPT: modo auto-validazione, ma ref_glm.json e' l'oracolo del modello TINY\n"
           "  (token max %d, il tuo vocab e' %d). Usa PROMPT=... per generare davvero (vedi sopra).\n",
           maxid, m.c.vocab, maxid, m.c.vocab);
-        return 1;
+        exit_status=1; goto model_cleanup;
       } }
 
     if(getenv("REPLAY")){
         run_replay(&m,full,nfull,np);
         if(stats) stats_dump(&m,stats);
-        return 0;
+        goto model_cleanup;
     }
 
     if(getenv("TF")){
@@ -7309,7 +7623,7 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
 #endif
-        return 0;
+        goto model_cleanup;
     }
     int *out=malloc((np+n_new)*sizeof(int));
     ProfBase pb; prof_base(&m,&pb);
@@ -7338,5 +7652,16 @@ int main(int argc, char **argv){
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
-    return 0;
+model_cleanup:
+#ifdef COLI_VULKAN
+    if(m.vulkan_context){
+        ColiVulkanResult cleanup_result=model_vulkan_release(&m);
+        if(cleanup_result!=COLI_VULKAN_OK){
+            fprintf(stderr,"[VULKAN] bounded model cleanup retained resources: %s\n",
+                    coli_vulkan_result_string(cleanup_result));
+            if(exit_status==0) exit_status=2;
+        }
+    }
+#endif
+    return exit_status;
 }

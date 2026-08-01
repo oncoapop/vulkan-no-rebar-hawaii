@@ -21,6 +21,7 @@ FILES = [
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     "tests/test_vulkan_staged_upload", "tests/test_backend_vulkan",
     "tests/test_vulkan_context", "tests/test_vulkan_context_sanitize",
+    "tests/test_vulkan_loader", "tests/test_vulkan_loader_sanitize",
 ]
 # Test binaries match this pattern. Only remove executables (.exe on Windows,
 # no extension on Unix) — never .c or .py source files.

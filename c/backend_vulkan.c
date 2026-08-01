@@ -1,7 +1,7 @@
-#define COLI_VULKAN_INTERNAL 1
 #include "backend_vulkan.h"
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -85,6 +85,15 @@ struct ColiVulkanTensor {
     VkBuffer buffer;
     VkDeviceMemory memory;
     ColiVulkanTensorLayout layout;
+    uint32_t fmt;
+    uint64_t I;
+    uint64_t O;
+    uint64_t gs;
+    uint64_t scale_count;
+    uint64_t effective_group_size;
+    uint64_t source_weight_bytes;
+    uint64_t source_scale_bytes;
+    uint64_t uploaded_scale_bytes;
     VkDeviceSize allocation_size;
     uint32_t memory_type_index;
     uint32_t heap_index;
@@ -435,6 +444,16 @@ static int align_up_u64(uint64_t value, uint64_t alignment, uint64_t *output) {
     return 1;
 }
 
+static int multiply_u64(uint64_t left, uint64_t right, uint64_t *output) {
+    if (!output || (right && left > UINT64_MAX / right)) return 0;
+    *output = left * right;
+    return 1;
+}
+
+static uint64_t ceil_div_u64(uint64_t value, uint64_t divisor) {
+    return value / divisor + (value % divisor != 0);
+}
+
 ColiVulkanResult coli_vulkan_plan_tensor_layout(
     uint64_t weight_bytes,
     uint64_t scale_bytes,
@@ -466,6 +485,112 @@ ColiVulkanResult coli_vulkan_plan_tensor_layout(
     layout->scale_offset = scale_bytes ? (VkDeviceSize)scale_offset : 0;
     layout->scale_size = (VkDeviceSize)scale_bytes;
     layout->packed_size = (VkDeviceSize)packed_size;
+    return COLI_VULKAN_OK;
+}
+
+ColiVulkanResult coli_vulkan_validate_qt_spec(
+    const ColiVulkanQTSpec *spec,
+    VkDeviceSize min_storage_buffer_offset_alignment,
+    ColiVulkanQTLayout *layout
+) {
+    _Static_assert(sizeof(float) == 4, "Vulkan QT metadata requires 32-bit float");
+    _Static_assert(FLT_RADIX == 2 && FLT_MANT_DIG == 24,
+        "Vulkan QT metadata requires IEEE-compatible binary32 float");
+    if (!spec || !layout || !spec->weights || spec->I == 0 || spec->O == 0 ||
+        spec->I > INT_MAX || spec->O > INT_MAX ||
+        min_storage_buffer_offset_alignment == 0)
+        return COLI_VULKAN_INVALID_ARGUMENT;
+
+    uint64_t row_bytes = 0, weight_bytes = 0, scale_count = 0;
+    uint64_t scale_bytes = 0, effective_group_size = 0;
+    switch (spec->fmt) {
+        case 0:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            if (!multiply_u64(spec->I, 4, &row_bytes) ||
+                !multiply_u64(spec->O, row_bytes, &weight_bytes))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            break;
+        case 1:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            if (!multiply_u64(spec->O, spec->I, &weight_bytes))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            scale_count = spec->O;
+            break;
+        case 2:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            row_bytes = ceil_div_u64(spec->I, 2);
+            if (!multiply_u64(spec->O, row_bytes, &weight_bytes))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            scale_count = spec->O;
+            break;
+        case 3:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            row_bytes = ceil_div_u64(spec->I, 4);
+            if (!multiply_u64(spec->O, row_bytes, &weight_bytes))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            scale_count = spec->O;
+            break;
+        case 4: {
+            static const uint64_t groups[] = {16, 32, 48, 64, 96, 128, 192, 256};
+            int supported = 0;
+            for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++)
+                if (spec->gs == groups[i]) supported = 1;
+            if (!supported || spec->gs > spec->I)
+                return COLI_VULKAN_UNSUPPORTED;
+            row_bytes = ceil_div_u64(spec->I, 2);
+            if (!multiply_u64(spec->O, row_bytes, &weight_bytes) ||
+                !multiply_u64(spec->O, ceil_div_u64(spec->I, spec->gs),
+                    &scale_count))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            effective_group_size = spec->gs;
+            break;
+        }
+        case 5:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            if (!multiply_u64(ceil_div_u64(spec->I, 64), 24, &row_bytes) ||
+                !multiply_u64(spec->O, row_bytes, &weight_bytes) ||
+                !multiply_u64(spec->O, ceil_div_u64(spec->I, 64),
+                    &scale_count))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            effective_group_size = 64;
+            break;
+        case 6:
+            if (spec->gs != 0) return COLI_VULKAN_UNSUPPORTED;
+            if (!multiply_u64(ceil_div_u64(spec->I, 256), 98, &row_bytes) ||
+                !multiply_u64(spec->O, row_bytes, &weight_bytes))
+                return COLI_VULKAN_LIMIT_EXCEEDED;
+            effective_group_size = 256;
+            break;
+        default:
+            return COLI_VULKAN_UNSUPPORTED;
+    }
+
+    if (spec->fmt == 6) {
+        if (!spec->scales || spec->scale_bytes != 4)
+            return COLI_VULKAN_INVALID_ARGUMENT;
+    } else {
+        if (!multiply_u64(scale_count, 4, &scale_bytes))
+            return COLI_VULKAN_LIMIT_EXCEEDED;
+        if ((scale_bytes != 0) != (spec->scales != NULL) ||
+            spec->scale_bytes != scale_bytes)
+            return COLI_VULKAN_INVALID_ARGUMENT;
+    }
+    if (spec->weight_bytes != weight_bytes ||
+        weight_bytes > SIZE_MAX || scale_bytes > SIZE_MAX ||
+        (uint64_t)(VkDeviceSize)weight_bytes != weight_bytes ||
+        (uint64_t)(VkDeviceSize)scale_bytes != scale_bytes)
+        return spec->weight_bytes == weight_bytes
+            ? COLI_VULKAN_LIMIT_EXCEEDED : COLI_VULKAN_INVALID_ARGUMENT;
+
+    ColiVulkanTensorLayout packed;
+    ColiVulkanResult result = coli_vulkan_plan_tensor_layout(weight_bytes,
+        scale_bytes, min_storage_buffer_offset_alignment, &packed);
+    if (result != COLI_VULKAN_OK) return result;
+    memset(layout, 0, sizeof(*layout));
+    layout->scale_count = scale_count;
+    layout->effective_group_size = effective_group_size;
+    layout->uploaded_scale_bytes = scale_bytes;
+    layout->packed = packed;
     return COLI_VULKAN_OK;
 }
 
@@ -947,7 +1072,7 @@ static ColiVulkanResult finish_pending_locked(
     return COLI_VULKAN_OK;
 }
 
-ColiVulkanResult coli_vulkan_tensor_upload(
+static ColiVulkanResult tensor_upload_raw(
     ColiVulkanContext *context,
     ColiVulkanTensor **tensor_out,
     const void *weights,
@@ -1042,6 +1167,54 @@ ColiVulkanResult coli_vulkan_tensor_upload(
         result = COLI_VULKAN_ERROR;
     }
     pthread_mutex_unlock(&context->mutex);
+    return result;
+}
+
+#ifdef COLI_VULKAN_TESTING
+ColiVulkanResult coli_vulkan_tensor_upload(
+    ColiVulkanContext *context,
+    ColiVulkanTensor **tensor_out,
+    const void *weights,
+    uint64_t weight_bytes,
+    const void *scales,
+    uint64_t scale_bytes,
+    uint64_t timeout_ns
+) {
+    return tensor_upload_raw(context, tensor_out, weights, weight_bytes, scales,
+        scale_bytes, timeout_ns);
+}
+#endif
+
+ColiVulkanResult coli_vulkan_tensor_create_qt(
+    ColiVulkanContext *context,
+    ColiVulkanTensor **tensor_out,
+    const ColiVulkanQTSpec *spec,
+    uint64_t timeout_ns
+) {
+    if (!context || !tensor_out || *tensor_out || !spec)
+        return COLI_VULKAN_INVALID_ARGUMENT;
+    VkDeviceSize alignment =
+        context->properties.limits.minStorageBufferOffsetAlignment;
+    if (!alignment) alignment = 1;
+    ColiVulkanQTLayout validated;
+    ColiVulkanResult result = coli_vulkan_validate_qt_spec(spec, alignment,
+        &validated);
+    if (result != COLI_VULKAN_OK) return result;
+    result = tensor_upload_raw(context, tensor_out, spec->weights,
+        spec->weight_bytes, spec->fmt == 6 ? NULL : spec->scales,
+        validated.uploaded_scale_bytes, timeout_ns);
+    if (*tensor_out) {
+        ColiVulkanTensor *tensor = *tensor_out;
+        tensor->fmt = spec->fmt;
+        tensor->I = spec->I;
+        tensor->O = spec->O;
+        tensor->gs = spec->gs;
+        tensor->scale_count = validated.scale_count;
+        tensor->effective_group_size = validated.effective_group_size;
+        tensor->source_weight_bytes = spec->weight_bytes;
+        tensor->source_scale_bytes = spec->scale_bytes;
+        tensor->uploaded_scale_bytes = validated.uploaded_scale_bytes;
+    }
     return result;
 }
 
@@ -1235,6 +1408,16 @@ ColiVulkanResult coli_vulkan_tensor_get_info(
         return COLI_VULKAN_INVALID_ARGUMENT;
     }
     info->layout = tensor->layout;
+    info->fmt = tensor->fmt;
+    info->I = tensor->I;
+    info->O = tensor->O;
+    info->gs = tensor->gs;
+    info->scale_count = tensor->scale_count;
+    info->effective_group_size = tensor->effective_group_size;
+    info->source_weight_bytes = tensor->source_weight_bytes;
+    info->source_scale_bytes = tensor->source_scale_bytes;
+    info->uploaded_scale_bytes = tensor->uploaded_scale_bytes;
+    info->compute_eligible = 0;
     info->allocation_size = tensor->allocation_size;
     info->memory_type_index = tensor->memory_type_index;
     info->heap_index = tensor->heap_index;
