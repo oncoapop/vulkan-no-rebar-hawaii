@@ -573,11 +573,18 @@ test-python: $(RANSLIB)
 tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
 
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -c backend_vulkan.c -o $@
+
+tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c backend_vulkan.o
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) tests/test_backend_vulkan.c backend_vulkan.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
 vulkan-test:
 	@if ! pkg-config --exists vulkan; then \
 		echo "SKIP: Vulkan development headers/libraries unavailable"; \
 	else \
 		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && ./tests/test_vulkan_staged_upload$(EXE); \
+		$(MAKE) tests/test_backend_vulkan$(EXE) && ./tests/test_backend_vulkan$(EXE); \
 	fi
 
 test: test-c test-python
