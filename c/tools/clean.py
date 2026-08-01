@@ -14,10 +14,13 @@ FILES = [
     "glm", "glm.exe",
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",
+    "backend_vulkan.o", "backend_vulkan_test.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
+    "tests/test_vulkan_staged_upload", "tests/test_backend_vulkan",
+    "tests/test_vulkan_context", "tests/test_vulkan_context_sanitize",
 ]
 # Test binaries match this pattern. Only remove executables (.exe on Windows,
 # no extension on Unix) — never .c or .py source files.

@@ -130,6 +130,7 @@ INSTALL    ?= install
 #                   clean. See backend_loader.c and README "cuda-dll" below.
 CUDA      ?= 0
 CUDA_DLL  ?= 0
+VULKAN    ?= 0
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -183,6 +184,11 @@ HIP       ?= 0
 ROCM_HOME ?= /opt/rocm
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
 HIP_ARCH  ?= native
+ifeq ($(VULKAN),1)
+ifneq ($(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(METAL)),)
+$(error VULKAN=1 cannot be combined with CUDA=1, CUDA_DLL=1, HIP=1, or METAL=1)
+endif
+endif
 # HIP_ARCH accepts a list (space- or comma-separated, e.g. "gfx906 gfx1030")
 # to fat-bundle several targets into one binary; COLI_GPUS picks at runtime.
 # `native` is resolved to the local GPUs' arch names HERE (not left to hipcc):
@@ -219,9 +225,14 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
-# Only compile Vulkan tests if Vulkan is actually available
-VULKAN_CFLAGS = $(shell pkg-config --cflags vulkan 2>/dev/null)
-VULKAN_LDFLAGS = $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
+# Vulkan remains completely opt-in. Phase 3A links only the persistent
+# context/tensor foundation; colibri.c does not dispatch Vulkan work yet.
+VULKAN_OBJ    =
+PKG_CONFIG ?= pkg-config
+VULKAN_AVAILABLE = $(shell $(PKG_CONFIG) --exists vulkan 2>/dev/null && echo 1)
+VULKAN_CFLAGS = $(shell $(PKG_CONFIG) --cflags vulkan 2>/dev/null)
+VULKAN_LDFLAGS = $(shell $(PKG_CONFIG) --libs vulkan 2>/dev/null || echo "-lvulkan")
+VULKAN_SANITIZER_FLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -292,6 +303,30 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
+ifeq ($(VULKAN),1)
+ifeq (,$(LINUX))
+$(error VULKAN=1 Phase 3A is supported only on Linux)
+endif
+ifneq ($(CUDA),0)
+$(error choose VULKAN=1 or CUDA=1, not both)
+endif
+ifneq ($(CUDA_DLL),0)
+$(error choose VULKAN=1 or CUDA_DLL=1, not both)
+endif
+ifneq ($(HIP),0)
+$(error choose VULKAN=1 or HIP=1, not both)
+endif
+ifneq ($(METAL),0)
+$(error choose VULKAN=1 or METAL=1, not both)
+endif
+ifneq ($(VULKAN_AVAILABLE),1)
+$(error VULKAN=1 requires Vulkan development headers and libraries)
+endif
+CFLAGS     += -DCOLI_VULKAN $(VULKAN_CFLAGS)
+LDFLAGS    += $(VULKAN_LDFLAGS)
+VULKAN_OBJ  = backend_vulkan.o
+endif
+
 all: colibri$(EXE)
 
 # phony targets — 'glm' kept for backward compatibility
@@ -305,7 +340,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VULKAN=$(VULKAN)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -318,8 +353,8 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -573,21 +608,64 @@ test-python: $(RANSLIB)
 tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
 
-backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -c backend_vulkan.c -o $@
 
-tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c backend_vulkan.o
-	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) tests/test_backend_vulkan.c backend_vulkan.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+backend_vulkan_test.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING -c backend_vulkan.c -o $@
 
-vulkan-test:
-	@if ! pkg-config --exists vulkan; then \
+tests/test_vulkan_context$(EXE): tests/test_vulkan_context.c backend_vulkan_test.o
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_vulkan_context.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+tests/test_vulkan_context_sanitize$(EXE): tests/test_vulkan_context.c backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_context.c backend_vulkan.c -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
+
+tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c backend_vulkan_test.o
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_backend_vulkan.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+vulkan-require-dev:
+	@if ! $(PKG_CONFIG) --exists vulkan; then \
+		echo "FAIL: Vulkan development headers/libraries are required" >&2; \
+		exit 1; \
+	fi
+
+vulkan-unit-test: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_context$(EXE) && \
+		./tests/test_vulkan_context$(EXE) && \
+		./tests/test_vulkan_context$(EXE) --device-lost
+
+vulkan-sanitize-test: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
+		env ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_context_sanitize$(EXE)
+
+vulkan-device-lost-sanitize-test: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
+		env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_context_sanitize$(EXE) --device-lost
+
+vulkan-hardware-test:
+	@if ! $(PKG_CONFIG) --exists vulkan; then \
 		echo "SKIP: Vulkan development headers/libraries unavailable"; \
 	else \
 		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && \
-		./tests/test_vulkan_staged_upload$(EXE) && \
+		env -u DISPLAY -u WAYLAND_DISPLAY ./tests/test_vulkan_staged_upload$(EXE) && \
 		$(MAKE) tests/test_backend_vulkan$(EXE) && \
-		./tests/test_backend_vulkan$(EXE); \
+		env -u DISPLAY -u WAYLAND_DISPLAY VULKAN_EXPERT_MB=64 ./tests/test_backend_vulkan$(EXE); \
 	fi
+
+vulkan-hardware-test-strict: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_staged_upload$(EXE) && \
+		env -u DISPLAY -u WAYLAND_DISPLAY ./tests/test_vulkan_staged_upload$(EXE) && \
+		$(MAKE) tests/test_backend_vulkan$(EXE) && \
+		env -u DISPLAY -u WAYLAND_DISPLAY VULKAN_EXPERT_MB=64 \
+		./tests/test_backend_vulkan$(EXE) --strict
+
+vulkan-test:
+	+$(MAKE) vulkan-unit-test && \
+		$(MAKE) vulkan-hardware-test-strict
 
 test: test-c test-python
 
@@ -648,4 +726,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-require-dev vulkan-unit-test vulkan-sanitize-test vulkan-device-lost-sanitize-test vulkan-hardware-test vulkan-hardware-test-strict vulkan-test check clean install uninstall bench
