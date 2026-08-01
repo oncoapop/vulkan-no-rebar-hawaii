@@ -57,7 +57,7 @@ int main() {
     createInfo.pApplicationInfo = &appInfo;
 
     VkResult res = vkCreateInstance(&createInfo, NULL, &instance);
-    if (res == VK_ERROR_INCOMPATIBLE_DRIVER || res == VK_ERROR_EXTENSION_NOT_PRESENT || res == VK_ERROR_INITIALIZATION_FAILED) {
+    if (res == VK_ERROR_INCOMPATIBLE_DRIVER) {
         printf("SKIP: Could not create Vulkan instance.\n");
         return 0;
     } else if (res != VK_SUCCESS) {
