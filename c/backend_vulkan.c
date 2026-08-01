@@ -7,8 +7,8 @@
             if (device != VK_NULL_HANDLE) { \
                 if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, NULL); \
                 if (commandBuffer != VK_NULL_HANDLE) vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer); \
-                if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, NULL); \
                 if (stagingBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, stagingBuffer, NULL); \
+                if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, NULL); \
             } \
             return VULKAN_UPLOAD_FAILURE; \
         } \
@@ -30,7 +30,10 @@ VulkanUploadResult vulkan_staged_upload(
     }
     memset(outOp, 0, sizeof(VulkanUploadOp));
 
-    if (!device || !queue || !commandPool || !memProps || !dstBuffer || !data) {
+    if (!device || !queue || !commandPool || !memProps || !dstBuffer || !data ||
+        size == 0 || size > (VkDeviceSize)SIZE_MAX ||
+        memProps->memoryTypeCount == 0 ||
+        memProps->memoryTypeCount > VK_MAX_MEMORY_TYPES) {
         return VULKAN_UPLOAD_FAILURE;
     }
 
@@ -49,6 +52,9 @@ VulkanUploadResult vulkan_staged_upload(
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device, stagingBuffer, &memReq);
+    if (memReq.size < size || memReq.memoryTypeBits == 0) {
+        CHECK_VK_CLEANUP(VK_ERROR_INITIALIZATION_FAILED);
+    }
 
     uint32_t memTypeIndex = (uint32_t)-1;
     for (uint32_t i = 0; i < memProps->memoryTypeCount; i++) {
@@ -117,8 +123,8 @@ VulkanUploadResult vulkan_staged_upload(
     if (waitRes == VK_SUCCESS) {
         vkDestroyFence(device, fence, NULL);
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
-        vkFreeMemory(device, stagingMemory, NULL);
         vkDestroyBuffer(device, stagingBuffer, NULL);
+        vkFreeMemory(device, stagingMemory, NULL);
         return VULKAN_UPLOAD_SUCCESS;
     } else {
         outOp->device = device;
@@ -148,8 +154,8 @@ VulkanUploadResult vulkan_upload_finish(
     if (waitRes == VK_SUCCESS) {
         vkDestroyFence(op->device, op->fence, NULL);
         vkFreeCommandBuffers(op->device, op->commandPool, 1, &op->commandBuffer);
-        vkFreeMemory(op->device, op->stagingMemory, NULL);
         vkDestroyBuffer(op->device, op->stagingBuffer, NULL);
+        vkFreeMemory(op->device, op->stagingMemory, NULL);
         memset(op, 0, sizeof(VulkanUploadOp));
         return VULKAN_UPLOAD_SUCCESS;
     } else if (waitRes == VK_TIMEOUT) {

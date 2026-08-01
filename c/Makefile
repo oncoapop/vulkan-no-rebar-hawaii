@@ -583,8 +583,10 @@ vulkan-test:
 	@if ! pkg-config --exists vulkan; then \
 		echo "SKIP: Vulkan development headers/libraries unavailable"; \
 	else \
-		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && ./tests/test_vulkan_staged_upload$(EXE); \
-		$(MAKE) tests/test_backend_vulkan$(EXE) && ./tests/test_backend_vulkan$(EXE); \
+		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && \
+		./tests/test_vulkan_staged_upload$(EXE) && \
+		$(MAKE) tests/test_backend_vulkan$(EXE) && \
+		./tests/test_backend_vulkan$(EXE); \
 	fi
 
 test: test-c test-python

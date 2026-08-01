@@ -16,6 +16,16 @@
         } \
     } while (0)
 
+#define CHECK_VK_READBACK(stmt, msg) \
+    do { \
+        VkResult res = (stmt); \
+        if (res != VK_SUCCESS) { \
+            printf("FAIL: %s returned %d\n", msg, res); \
+            failed = 1; \
+            goto cleanup_readback; \
+        } \
+    } while (0)
+
 int main(void) {
     int failed = 0;
     VkInstance instance = VK_NULL_HANDLE;
@@ -25,8 +35,15 @@ int main(void) {
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkBuffer deviceBuffer = VK_NULL_HANDLE;
     VkDeviceMemory deviceMemory = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProperties;
     VkPhysicalDevice *devices = NULL;
+    VulkanUploadOp op = {0};
+    int readbackSubmitted = 0;
+    int readbackComplete = 0;
 
     VkApplicationInfo appInfo = {0};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -190,38 +207,51 @@ int main(void) {
         uploadData[i] = (uint8_t)(i % 256);
     }
 
-    VulkanUploadOp op = {0};
+    /* This test owns the queue and command pool and uses both on one thread. */
+    VulkanUploadOp zeroSizeOp = {0};
+    VulkanUploadResult zeroSizeRes = vulkan_staged_upload(
+        device, queue, commandPool, &memProperties, deviceBuffer,
+        0, uploadData, FENCE_TIMEOUT, &zeroSizeOp);
+    if (zeroSizeRes != VULKAN_UPLOAD_FAILURE || zeroSizeOp.device != VK_NULL_HANDLE) {
+        printf("FAIL: vulkan_staged_upload accepted a zero-sized upload.\n");
+        failed = 1;
+        goto cleanup;
+    }
+
     VulkanUploadResult uploadRes = vulkan_staged_upload(
         device, queue, commandPool, &memProperties, deviceBuffer,
         TEST_BUFFER_SIZE, uploadData, FENCE_TIMEOUT, &op);
 
-    if (uploadRes == VULKAN_UPLOAD_TIMEOUT) {
-        // Wait for it again
-        uploadRes = vulkan_upload_finish(&op, FENCE_TIMEOUT);
+    /* A timeout or fence error after submit retains resources in op. */
+    if (op.device != VK_NULL_HANDLE) {
+        VulkanUploadResult finishRes = vulkan_upload_finish(&op, FENCE_TIMEOUT);
+        if (finishRes != VULKAN_UPLOAD_SUCCESS) {
+            printf("FAIL: vulkan_upload_finish returned %d; upload resources remain retained.\n",
+                   finishRes);
+            failed = 1;
+            goto cleanup;
+        }
+        uploadRes = VULKAN_UPLOAD_SUCCESS;
     }
 
     if (uploadRes != VULKAN_UPLOAD_SUCCESS) {
-        printf("FAIL: vulkan_staged_upload failed or timed out.\n");
+        printf("FAIL: vulkan_staged_upload returned %d.\n", uploadRes);
         failed = 1;
-        // deliberate leak path on timeout
-        if (uploadRes == VULKAN_UPLOAD_TIMEOUT) {
-            return 1;
-        }
         goto cleanup;
     }
 
     // Now verify the data using a direct readback similar to test_vulkan_staged_upload.c
     // We will do a manual readback here, allocating a temporary readback buffer
 
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-
     bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    CHECK_VK(vkCreateBuffer(device, &bufferInfo, NULL, &stagingBuffer), "vkCreateBuffer (staging)");
+    CHECK_VK_READBACK(vkCreateBuffer(device, &bufferInfo, NULL, &stagingBuffer), "vkCreateBuffer (staging)");
     VkMemoryRequirements stagingMemReq;
     vkGetBufferMemoryRequirements(device, stagingBuffer, &stagingMemReq);
+    if (stagingMemReq.size < TEST_BUFFER_SIZE || stagingMemReq.memoryTypeBits == 0) {
+        printf("FAIL: Invalid staging buffer memory requirements.\n");
+        failed = 1;
+        goto cleanup_readback;
+    }
 
     uint32_t stagingMemTypeIndex = (uint32_t)-1;
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
@@ -241,50 +271,54 @@ int main(void) {
 
     allocInfo.allocationSize = stagingMemReq.size;
     allocInfo.memoryTypeIndex = stagingMemTypeIndex;
-    CHECK_VK(vkAllocateMemory(device, &allocInfo, NULL, &stagingMemory), "vkAllocateMemory (staging)");
-    CHECK_VK(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0), "vkBindBufferMemory (staging)");
+    CHECK_VK_READBACK(vkAllocateMemory(device, &allocInfo, NULL, &stagingMemory), "vkAllocateMemory (staging)");
+    CHECK_VK_READBACK(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0), "vkBindBufferMemory (staging)");
 
     VkCommandBufferAllocateInfo cmdAllocInfo = {0};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmdAllocInfo.commandPool = commandPool;
     cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmdAllocInfo.commandBufferCount = 1;
-    CHECK_VK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &commandBuffer), "vkAllocateCommandBuffers");
+    CHECK_VK_READBACK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &commandBuffer), "vkAllocateCommandBuffers");
 
     VkCommandBufferBeginInfo beginInfo = {0};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    CHECK_VK_READBACK(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
     VkBufferCopy copyRegion = {0};
     copyRegion.srcOffset = 0;
     copyRegion.dstOffset = 0;
     copyRegion.size = TEST_BUFFER_SIZE;
     vkCmdCopyBuffer(commandBuffer, deviceBuffer, stagingBuffer, 1, &copyRegion);
-    CHECK_VK(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    CHECK_VK_READBACK(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
 
     VkFenceCreateInfo fenceInfo = {0};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    CHECK_VK(vkCreateFence(device, &fenceInfo, NULL, &fence), "vkCreateFence");
+    CHECK_VK_READBACK(vkCreateFence(device, &fenceInfo, NULL, &fence), "vkCreateFence");
 
     VkSubmitInfo submitInfo = {0};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
-    CHECK_VK(vkQueueSubmit(queue, 1, &submitInfo, fence), "vkQueueSubmit");
+    VkResult submitRes = vkQueueSubmit(queue, 1, &submitInfo, fence);
+    if (submitRes != VK_SUCCESS) {
+        printf("FAIL: vkQueueSubmit returned %d\n", submitRes);
+        failed = 1;
+        goto cleanup_readback;
+    }
+    readbackSubmitted = 1;
 
     VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, FENCE_TIMEOUT);
     if (waitRes != VK_SUCCESS) {
         printf("FAIL: vkWaitForFences returned %d\n", waitRes);
         failed = 1;
-        if (waitRes == VK_TIMEOUT) {
-            return 1;
-        }
         goto cleanup_readback;
     }
+    readbackComplete = 1;
 
     void *mapped = NULL;
-    CHECK_VK(vkMapMemory(device, stagingMemory, 0, TEST_BUFFER_SIZE, 0, &mapped), "vkMapMemory");
+    CHECK_VK_READBACK(vkMapMemory(device, stagingMemory, 0, TEST_BUFFER_SIZE, 0, &mapped), "vkMapMemory");
     for (int i = 0; i < TEST_BUFFER_SIZE; i++) {
         if (((uint8_t*)mapped)[i] != (uint8_t)(i % 256)) {
             printf("FAIL: Readback validation failed at offset %d.\n", i);
@@ -299,12 +333,24 @@ int main(void) {
     }
 
 cleanup_readback:
+    if (readbackSubmitted && !readbackComplete) {
+        printf("FAIL: Readback work may still be pending; Vulkan resources are intentionally retained.\n");
+        return 1;
+    }
     if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, NULL);
     if (commandBuffer != VK_NULL_HANDLE) vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
-    if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, NULL);
     if (stagingBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, stagingBuffer, NULL);
+    if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, NULL);
 
 cleanup:
+    if (readbackSubmitted && !readbackComplete) {
+        printf("FAIL: Readback work may still be pending; Vulkan resources are intentionally retained.\n");
+        return 1;
+    }
+    if (op.device != VK_NULL_HANDLE) {
+        printf("FAIL: Upload work may still be pending; Vulkan resources are intentionally retained.\n");
+        return 1;
+    }
     if (device != VK_NULL_HANDLE) {
         if (commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(device, commandPool, NULL);
