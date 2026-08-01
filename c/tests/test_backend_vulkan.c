@@ -1,370 +1,221 @@
 #include "../backend_vulkan.h"
+
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_BUFFER_SIZE 4096
-#define FENCE_TIMEOUT 5000000000ULL // 5 seconds in nanoseconds
+#define FENCE_TIMEOUT_NS 5000000000ULL
+#define TEST_WEIGHT_BYTES 4093u
+#define TEST_SCALE_BYTES 513u
 
-#define CHECK_VK(stmt, msg) \
-    do { \
-        VkResult res = (stmt); \
-        if (res != VK_SUCCESS) { \
-            printf("FAIL: %s returned %d\n", msg, res); \
-            failed = 1; \
-            goto cleanup; \
-        } \
-    } while (0)
+static int fail_result(const char *what, ColiVulkanResult result) {
+    fprintf(stderr, "FAIL: %s: %s\n", what, coli_vulkan_result_string(result));
+    return 1;
+}
 
-#define CHECK_VK_READBACK(stmt, msg) \
-    do { \
-        VkResult res = (stmt); \
-        if (res != VK_SUCCESS) { \
-            printf("FAIL: %s returned %d\n", msg, res); \
-            failed = 1; \
-            goto cleanup_readback; \
-        } \
-    } while (0)
-
-int main(void) {
-    int failed = 0;
-    VkInstance instance = VK_NULL_HANDLE;
-    VkPhysicalDevice hawaiiDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkBuffer deviceBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory deviceMemory = VK_NULL_HANDLE;
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-    VkPhysicalDeviceMemoryProperties memProperties;
-    VkPhysicalDevice *devices = NULL;
-    VulkanUploadOp op = {0};
-    int readbackSubmitted = 0;
-    int readbackComplete = 0;
-
-    VkApplicationInfo appInfo = {0};
-    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "Colibri Vulkan Hardware Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = "No Engine";
-    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
-
-    VkInstanceCreateInfo createInfo = {0};
-    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    createInfo.pApplicationInfo = &appInfo;
-
-    VkResult initRes = vkCreateInstance(&createInfo, NULL, &instance);
-    if (initRes == VK_ERROR_INCOMPATIBLE_DRIVER) {
-        printf("SKIP: Incompatible Vulkan driver.\n");
-        return 0;
+int main(int argc, char **argv) {
+    int strict = 0;
+    if (argc == 2 && strcmp(argv[1], "--strict") == 0) {
+        strict = 1;
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: %s [--strict]\n", argv[0]);
+        return 2;
     }
-    if (initRes != VK_SUCCESS) {
-        printf("FAIL: vkCreateInstance returned %d\n", initRes);
+    int failed = 0;
+    ColiVulkanConfig config;
+    ColiVulkanResult result = coli_vulkan_config_from_env(&config, FENCE_TIMEOUT_NS);
+    if (result != COLI_VULKAN_OK) {
+        fprintf(stderr,
+            "FAIL: VULKAN_EXPERT_MB must be explicitly set (hardware tests use 64)\n");
+        return 1;
+    }
+    if (config.expert_budget_bytes != 64ULL * 1024ULL * 1024ULL) {
+        fprintf(stderr, "FAIL: hardware test requires VULKAN_EXPERT_MB=64\n");
         return 1;
     }
 
-    uint32_t deviceCount = 0;
-    VkResult enumRes;
-    do {
-        enumRes = vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
-        if (enumRes == VK_SUCCESS && deviceCount > 0) {
-            devices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
-            if (!devices) {
-                printf("FAIL: Out of memory for devices array.\n");
-                failed = 1;
-                goto cleanup;
-            }
-            enumRes = vkEnumeratePhysicalDevices(instance, &deviceCount, devices);
-            if (enumRes == VK_INCOMPLETE) {
-                free(devices);
-                devices = NULL;
-            }
+    ColiVulkanContext *context = NULL;
+    result = coli_vulkan_context_create(&context, &config);
+    if (result == COLI_VULKAN_UNAVAILABLE) {
+        if (strict) {
+            fprintf(stderr,
+                "FAIL: strict hardware acceptance requires exact AMD R9 390 0x1002/0x67b1\n");
+            return 1;
         }
-    } while (enumRes == VK_INCOMPLETE);
+        printf("SKIP: exact AMD R9 390 0x1002/0x67b1 is unavailable\n");
+        return 0;
+    }
+    if (result != COLI_VULKAN_OK) return fail_result("context create", result);
 
-    if (enumRes != VK_SUCCESS || deviceCount == 0 || !devices) {
-        printf("SKIP: No Vulkan devices found.\n");
+    ColiVulkanContextInfo context_info;
+    result = coli_vulkan_context_get_info(context, &context_info);
+    if (result != COLI_VULKAN_OK) {
+        failed = fail_result("context info", result);
         goto cleanup;
     }
+    printf("device vendor=0x%04x device=0x%04x queueFamily=%u\n",
+        context_info.vendor_id, context_info.device_id,
+        context_info.queue_family_index);
+    printf("limits maxMemoryAllocationCount=%u minStorageBufferOffsetAlignment=%" PRIu64 "\n",
+        context_info.max_memory_allocation_count,
+        (uint64_t)context_info.min_storage_buffer_offset_alignment);
+    printf("budget requested=%" PRIu64 " effective=%" PRIu64 " reserve=%" PRIu64 "\n",
+        context_info.requested_budget_bytes, context_info.effective_budget_bytes,
+        (uint64_t)COLI_VULKAN_VRAM_RESERVE_BYTES);
 
-    const uint32_t hawaiiIds[] = {0x67B0, 0x67B1, 0x67B8, 0x67B9, 0x67A0, 0x67A1, 0x67A2, 0x67A8, 0x67A9};
-    const int numHawaiiIds = sizeof(hawaiiIds) / sizeof(hawaiiIds[0]);
-
-    for (uint32_t i = 0; i < deviceCount; i++) {
-        VkPhysicalDeviceProperties deviceProperties;
-        vkGetPhysicalDeviceProperties(devices[i], &deviceProperties);
-        if (deviceProperties.vendorID == 0x1002) {
-            for (int j = 0; j < numHawaiiIds; j++) {
-                if (deviceProperties.deviceID == hawaiiIds[j]) {
-                    hawaiiDevice = devices[i];
-                    break;
-                }
-            }
-        }
-        if (hawaiiDevice != VK_NULL_HANDLE) break;
-    }
-
-    if (hawaiiDevice == VK_NULL_HANDLE) {
-        printf("SKIP: No AMD Hawaii GPU found.\n");
-        goto cleanup;
-    }
-
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(hawaiiDevice, &queueFamilyCount, NULL);
-    if (queueFamilyCount == 0) {
-        printf("FAIL: No queue families found on the device.\n");
+    if (context_info.vendor_id != COLI_VULKAN_VENDOR_ID ||
+        context_info.device_id != COLI_VULKAN_DEVICE_ID) {
+        fprintf(stderr, "FAIL: selected device is not exact 0x1002/0x67b1\n");
         failed = 1;
         goto cleanup;
     }
-    VkQueueFamilyProperties *queueFamilies = malloc(sizeof(VkQueueFamilyProperties) * queueFamilyCount);
-    if (!queueFamilies) {
-        printf("FAIL: Out of memory for queue families array.\n");
+    if (!context_info.max_memory_allocation_count ||
+        !context_info.min_storage_buffer_offset_alignment) {
+        fprintf(stderr, "FAIL: invalid physical-device limits\n");
         failed = 1;
         goto cleanup;
     }
-    vkGetPhysicalDeviceQueueFamilyProperties(hawaiiDevice, &queueFamilyCount, queueFamilies);
-
-    int transferQueueFamily = -1;
-    for (uint32_t i = 0; i < queueFamilyCount; i++) {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT || queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT || queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            transferQueueFamily = i;
-            break;
-        }
-    }
-    free(queueFamilies);
-
-    if (transferQueueFamily == -1) {
-        printf("FAIL: No suitable transfer queue found.\n");
+    if (context_info.requested_budget_bytes != 64ULL * 1024ULL * 1024ULL ||
+        context_info.effective_budget_bytes > context_info.requested_budget_bytes) {
+        fprintf(stderr, "FAIL: explicit 64 MiB cap was not enforced\n");
         failed = 1;
         goto cleanup;
     }
 
-    float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueCreateInfo = {0};
-    queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueCreateInfo.queueFamilyIndex = transferQueueFamily;
-    queueCreateInfo.queueCount = 1;
-    queueCreateInfo.pQueuePriorities = &queuePriority;
-
-    VkDeviceCreateInfo deviceCreateInfo = {0};
-    deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
-    deviceCreateInfo.queueCreateInfoCount = 1;
-
-    CHECK_VK(vkCreateDevice(hawaiiDevice, &deviceCreateInfo, NULL, &device), "vkCreateDevice");
-    vkGetDeviceQueue(device, transferQueueFamily, 0, &queue);
-    vkGetPhysicalDeviceMemoryProperties(hawaiiDevice, &memProperties);
-
-    VkBufferCreateInfo bufferInfo = {0};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = TEST_BUFFER_SIZE;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    CHECK_VK(vkCreateBuffer(device, &bufferInfo, NULL, &deviceBuffer), "vkCreateBuffer (device)");
-
-    VkMemoryRequirements deviceMemReq;
-    vkGetBufferMemoryRequirements(device, deviceBuffer, &deviceMemReq);
-    if (deviceMemReq.size == 0 || deviceMemReq.memoryTypeBits == 0) {
-        printf("FAIL: Invalid device buffer memory requirements.\n");
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    result = coli_vulkan_context_get_memory_properties(context, &memory_properties);
+    if (result != COLI_VULKAN_OK) {
+        failed = fail_result("memory properties", result);
+        goto cleanup;
+    }
+    printf("memory heaps=%u types=%u\n", memory_properties.memoryHeapCount,
+        memory_properties.memoryTypeCount);
+    if (memory_properties.memoryHeapCount != 3 ||
+        memory_properties.memoryTypeCount != 7) {
+        fprintf(stderr, "FAIL: expected the host capture's three heaps and seven types\n");
         failed = 1;
         goto cleanup;
     }
-
-    uint32_t deviceLocalMemTypeIndex = (uint32_t)-1;
-    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((deviceMemReq.memoryTypeBits & (1u << i)) &&
-            (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-            !(memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-            deviceLocalMemTypeIndex = i;
-            break;
-        }
-    }
-    if (deviceLocalMemTypeIndex == (uint32_t)-1) {
-        printf("SKIP: Could not find strictly DEVICE_LOCAL (non-HOST_VISIBLE) memory type.\n");
-        goto cleanup;
-    }
-
-    VkMemoryAllocateInfo allocInfo = {0};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = deviceMemReq.size;
-    allocInfo.memoryTypeIndex = deviceLocalMemTypeIndex;
-    CHECK_VK(vkAllocateMemory(device, &allocInfo, NULL, &deviceMemory), "vkAllocateMemory (device)");
-    CHECK_VK(vkBindBufferMemory(device, deviceBuffer, deviceMemory, 0), "vkBindBufferMemory (device)");
-
-    VkCommandPoolCreateInfo poolInfo = {0};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = transferQueueFamily;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    CHECK_VK(vkCreateCommandPool(device, &poolInfo, NULL, &commandPool), "vkCreateCommandPool");
-
-    // Prepare upload data
-    uint8_t uploadData[TEST_BUFFER_SIZE];
-    for (int i = 0; i < TEST_BUFFER_SIZE; i++) {
-        uploadData[i] = (uint8_t)(i % 256);
-    }
-
-    /* This test owns the queue and command pool and uses both on one thread. */
-    VulkanUploadOp zeroSizeOp = {0};
-    VulkanUploadResult zeroSizeRes = vulkan_staged_upload(
-        device, queue, commandPool, &memProperties, deviceBuffer,
-        0, uploadData, FENCE_TIMEOUT, &zeroSizeOp);
-    if (zeroSizeRes != VULKAN_UPLOAD_FAILURE || zeroSizeOp.device != VK_NULL_HANDLE) {
-        printf("FAIL: vulkan_staged_upload accepted a zero-sized upload.\n");
+    if (memory_properties.memoryHeaps[2].size != 268435456ULL) {
+        fprintf(stderr, "FAIL: heap 2 is not the 256 MiB BAR\n");
         failed = 1;
         goto cleanup;
     }
-
-    VulkanUploadResult uploadRes = vulkan_staged_upload(
-        device, queue, commandPool, &memProperties, deviceBuffer,
-        TEST_BUFFER_SIZE, uploadData, FENCE_TIMEOUT, &op);
-
-    /* A timeout or fence error after submit retains resources in op. */
-    if (op.device != VK_NULL_HANDLE) {
-        VulkanUploadResult finishRes = vulkan_upload_finish(&op, FENCE_TIMEOUT);
-        if (finishRes != VULKAN_UPLOAD_SUCCESS) {
-            printf("FAIL: vulkan_upload_finish returned %d; upload resources remain retained.\n",
-                   finishRes);
+    for (uint32_t i = 3; i <= 4; i++) {
+        if (memory_properties.memoryTypes[i].heapIndex != 2 ||
+            memory_properties.memoryTypes[i].propertyFlags != 0x0007u) {
+            fprintf(stderr,
+                "FAIL: memory type %u does not match heap 2/propertyFlags 0x0007\n", i);
             failed = 1;
             goto cleanup;
         }
-        uploadRes = VULKAN_UPLOAD_SUCCESS;
     }
 
-    if (uploadRes != VULKAN_UPLOAD_SUCCESS) {
-        printf("FAIL: vulkan_staged_upload returned %d.\n", uploadRes);
-        failed = 1;
-        goto cleanup;
-    }
+    for (unsigned iteration = 0; iteration < 3; iteration++) {
+        uint8_t weights[TEST_WEIGHT_BYTES];
+        uint8_t scales[TEST_SCALE_BYTES];
+        for (size_t i = 0; i < sizeof(weights); i++)
+            weights[i] = (uint8_t)((i * 29u + iteration * 17u) & 0xffu);
+        for (size_t i = 0; i < sizeof(scales); i++)
+            scales[i] = (uint8_t)((i * 13u + iteration * 31u) & 0xffu);
 
-    // Now verify the data using a direct readback similar to test_vulkan_staged_upload.c
-    // We will do a manual readback here, allocating a temporary readback buffer
-
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    CHECK_VK_READBACK(vkCreateBuffer(device, &bufferInfo, NULL, &stagingBuffer), "vkCreateBuffer (staging)");
-    VkMemoryRequirements stagingMemReq;
-    vkGetBufferMemoryRequirements(device, stagingBuffer, &stagingMemReq);
-    if (stagingMemReq.size < TEST_BUFFER_SIZE || stagingMemReq.memoryTypeBits == 0) {
-        printf("FAIL: Invalid staging buffer memory requirements.\n");
-        failed = 1;
-        goto cleanup_readback;
-    }
-
-    uint32_t stagingMemTypeIndex = (uint32_t)-1;
-    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((stagingMemReq.memoryTypeBits & (1u << i)) &&
-            (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-            (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            stagingMemTypeIndex = i;
-            break;
+        ColiVulkanTensor *tensor = NULL;
+        result = coli_vulkan_tensor_upload(context, &tensor, weights,
+            sizeof(weights), scales, sizeof(scales), FENCE_TIMEOUT_NS);
+        if (result == COLI_VULKAN_TIMEOUT && tensor) {
+            result = coli_vulkan_finish_pending(context, FENCE_TIMEOUT_NS);
         }
-    }
+        if (result != COLI_VULKAN_OK || !tensor) {
+            failed = fail_result("tensor upload", result);
+            goto cleanup;
+        }
 
-    if (stagingMemTypeIndex == (uint32_t)-1) {
-        printf("FAIL: Could not find HOST_VISIBLE memory type for staging buffer.\n");
-        failed = 1;
-        goto cleanup_readback;
-    }
-
-    allocInfo.allocationSize = stagingMemReq.size;
-    allocInfo.memoryTypeIndex = stagingMemTypeIndex;
-    CHECK_VK_READBACK(vkAllocateMemory(device, &allocInfo, NULL, &stagingMemory), "vkAllocateMemory (staging)");
-    CHECK_VK_READBACK(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0), "vkBindBufferMemory (staging)");
-
-    VkCommandBufferAllocateInfo cmdAllocInfo = {0};
-    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool = commandPool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-    CHECK_VK_READBACK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &commandBuffer), "vkAllocateCommandBuffers");
-
-    VkCommandBufferBeginInfo beginInfo = {0};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK_READBACK(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
-
-    VkBufferCopy copyRegion = {0};
-    copyRegion.srcOffset = 0;
-    copyRegion.dstOffset = 0;
-    copyRegion.size = TEST_BUFFER_SIZE;
-    vkCmdCopyBuffer(commandBuffer, deviceBuffer, stagingBuffer, 1, &copyRegion);
-    CHECK_VK_READBACK(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
-
-    VkFenceCreateInfo fenceInfo = {0};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    CHECK_VK_READBACK(vkCreateFence(device, &fenceInfo, NULL, &fence), "vkCreateFence");
-
-    VkSubmitInfo submitInfo = {0};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
-    VkResult submitRes = vkQueueSubmit(queue, 1, &submitInfo, fence);
-    if (submitRes != VK_SUCCESS) {
-        printf("FAIL: vkQueueSubmit returned %d\n", submitRes);
-        failed = 1;
-        goto cleanup_readback;
-    }
-    readbackSubmitted = 1;
-
-    VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, FENCE_TIMEOUT);
-    if (waitRes != VK_SUCCESS) {
-        printf("FAIL: vkWaitForFences returned %d\n", waitRes);
-        failed = 1;
-        goto cleanup_readback;
-    }
-    readbackComplete = 1;
-
-    void *mapped = NULL;
-    CHECK_VK_READBACK(vkMapMemory(device, stagingMemory, 0, TEST_BUFFER_SIZE, 0, &mapped), "vkMapMemory");
-    for (int i = 0; i < TEST_BUFFER_SIZE; i++) {
-        if (((uint8_t*)mapped)[i] != (uint8_t)(i % 256)) {
-            printf("FAIL: Readback validation failed at offset %d.\n", i);
+        ColiVulkanTensorInfo tensor_info;
+        result = coli_vulkan_tensor_get_info(tensor, &tensor_info);
+        if (result != COLI_VULKAN_OK) {
+            failed = fail_result("tensor info", result);
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            goto cleanup;
+        }
+        VkDeviceSize alignment = context_info.min_storage_buffer_offset_alignment;
+        if (tensor_info.state != COLI_VULKAN_TENSOR_READY ||
+            tensor_info.layout.weight_offset % alignment != 0 ||
+            tensor_info.layout.scale_offset % alignment != 0 ||
+            !(tensor_info.memory_property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+            (tensor_info.memory_property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+            tensor_info.heap_index == 2) {
+            fprintf(stderr, "FAIL: tensor layout or strict-local placement is invalid\n");
             failed = 1;
-            break;
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            goto cleanup;
+        }
+        printf("tensor[%u] packed=%" PRIu64 " allocation=%" PRIu64
+               " weightOffset=%" PRIu64 " scaleOffset=%" PRIu64
+               " memoryType=%u heap=%u flags=0x%04x\n",
+            iteration, (uint64_t)tensor_info.layout.packed_size,
+            (uint64_t)tensor_info.allocation_size,
+            (uint64_t)tensor_info.layout.weight_offset,
+            (uint64_t)tensor_info.layout.scale_offset,
+            tensor_info.memory_type_index, tensor_info.heap_index,
+            tensor_info.memory_property_flags);
+
+        uint8_t *readback = malloc((size_t)tensor_info.layout.packed_size);
+        if (!readback) {
+            fprintf(stderr, "FAIL: readback allocation\n");
+            failed = 1;
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            goto cleanup;
+        }
+        memset(readback, 0xa5, (size_t)tensor_info.layout.packed_size);
+        result = coli_vulkan_tensor_readback(context, tensor, readback,
+            (uint64_t)tensor_info.layout.packed_size, FENCE_TIMEOUT_NS);
+        if (result == COLI_VULKAN_TIMEOUT) {
+            result = coli_vulkan_finish_pending(context, FENCE_TIMEOUT_NS);
+            if (result == COLI_VULKAN_OK)
+                result = coli_vulkan_tensor_readback(context, tensor, readback,
+                    (uint64_t)tensor_info.layout.packed_size, FENCE_TIMEOUT_NS);
+        }
+        if (result != COLI_VULKAN_OK) {
+            failed = fail_result("tensor readback", result);
+            free(readback);
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            goto cleanup;
+        }
+        if (memcmp(readback + tensor_info.layout.weight_offset, weights,
+                sizeof(weights)) != 0 ||
+            memcmp(readback + tensor_info.layout.scale_offset, scales,
+                sizeof(scales)) != 0) {
+            fprintf(stderr, "FAIL: exact packed byte readback mismatch\n");
+            failed = 1;
+            free(readback);
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            goto cleanup;
+        }
+        free(readback);
+
+        result = coli_vulkan_tensor_free(context, &tensor);
+        if (result != COLI_VULKAN_OK || tensor) {
+            failed = fail_result("tensor free", result);
+            goto cleanup;
+        }
+        result = coli_vulkan_context_get_info(context, &context_info);
+        if (result != COLI_VULKAN_OK || context_info.committed_bytes != 0 ||
+            context_info.live_tensors != 0 || context_info.live_allocations != 0 ||
+            context_info.pending_operations != 0) {
+            fprintf(stderr, "FAIL: counters did not return to zero\n");
+            failed = 1;
+            goto cleanup;
         }
     }
-    vkUnmapMemory(device, stagingMemory);
-
-    if (!failed) {
-        printf("PASS\n");
-    }
-
-cleanup_readback:
-    if (readbackSubmitted && !readbackComplete) {
-        printf("FAIL: Readback work may still be pending; Vulkan resources are intentionally retained.\n");
-        return 1;
-    }
-    if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, NULL);
-    if (commandBuffer != VK_NULL_HANDLE) vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
-    if (stagingBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, stagingBuffer, NULL);
-    if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, NULL);
 
 cleanup:
-    if (readbackSubmitted && !readbackComplete) {
-        printf("FAIL: Readback work may still be pending; Vulkan resources are intentionally retained.\n");
-        return 1;
+    result = coli_vulkan_context_destroy(&context, FENCE_TIMEOUT_NS);
+    if (result != COLI_VULKAN_OK || context) {
+        fprintf(stderr, "FAIL: context destroy: %s\n",
+            coli_vulkan_result_string(result));
+        failed = 1;
     }
-    if (op.device != VK_NULL_HANDLE) {
-        printf("FAIL: Upload work may still be pending; Vulkan resources are intentionally retained.\n");
-        return 1;
-    }
-    if (device != VK_NULL_HANDLE) {
-        if (commandPool != VK_NULL_HANDLE) {
-            vkDestroyCommandPool(device, commandPool, NULL);
-        }
-        if (deviceBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, deviceBuffer, NULL);
-        }
-        if (deviceMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, deviceMemory, NULL);
-        }
-        vkDestroyDevice(device, NULL);
-    }
-    if (devices) free(devices);
-    if (instance != VK_NULL_HANDLE) vkDestroyInstance(instance, NULL);
-
+    if (!failed) printf("PASS: persistent Vulkan Phase 3A hardware lifecycle\n");
     return failed ? 1 : 0;
 }
