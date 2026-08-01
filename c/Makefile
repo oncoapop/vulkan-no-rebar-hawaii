@@ -219,6 +219,10 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
+# Only compile Vulkan tests if Vulkan is actually available
+VULKAN_CFLAGS = $(shell pkg-config --cflags vulkan 2>/dev/null)
+VULKAN_LDFLAGS = $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
+
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
@@ -566,6 +570,16 @@ test-c: $(TEST_BINS)
 test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
+tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+vulkan-test:
+	@if ! pkg-config --exists vulkan; then \
+		echo "SKIP: Vulkan development headers/libraries unavailable"; \
+	else \
+		$(MAKE) tests/test_vulkan_staged_upload$(EXE) && ./tests/test_vulkan_staged_upload$(EXE); \
+	fi
+
 test: test-c test-python
 
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
@@ -625,4 +639,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-test check clean install uninstall bench
