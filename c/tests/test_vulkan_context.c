@@ -2,6 +2,8 @@
 #include "../backend_vulkan.h"
 
 #include <inttypes.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,12 @@ typedef enum {
     FP_CREATE_FENCE,
     FP_QUEUE_SUBMIT,
     FP_WAIT_FENCE,
+    FP_CREATE_SHADER,
+    FP_CREATE_DESCRIPTOR_LAYOUT,
+    FP_CREATE_PIPELINE_LAYOUT,
+    FP_CREATE_PIPELINE,
+    FP_CREATE_DESCRIPTOR_POOL,
+    FP_ALLOCATE_DESCRIPTOR_SET,
     FP_COUNT
 } FaultPoint;
 
@@ -75,6 +83,23 @@ typedef struct {
     unsigned create_fence_count;
     unsigned destroy_fence_count;
     unsigned queue_submit_count;
+    unsigned create_shader_count, destroy_shader_count;
+    unsigned create_descriptor_layout_count, destroy_descriptor_layout_count;
+    unsigned create_pipeline_layout_count, destroy_pipeline_layout_count;
+    unsigned create_pipeline_count, destroy_pipeline_count;
+    unsigned create_descriptor_pool_count, destroy_descriptor_pool_count;
+    unsigned allocate_descriptor_set_count;
+    unsigned update_descriptor_count;
+    unsigned pipeline_barrier_count;
+    unsigned bind_pipeline_count, bind_descriptor_count, push_constant_count;
+    unsigned dispatch_count;
+    unsigned host_to_compute_barrier_count;
+    unsigned compute_to_host_barrier_count;
+    VkBuffer descriptor_buffers[3];
+    VkDeviceSize descriptor_ranges[3];
+    uint32_t push_constants[6];
+    volatile unsigned api_active;
+    volatile unsigned api_max_active;
 } FakeState;
 
 static FakeState g_fake;
@@ -148,6 +173,28 @@ static void fake_check_no_live_resources(const char *where) {
             g_fake.allocate_command_buffer_count,
             g_fake.free_command_buffer_count,
             g_fake.create_fence_count, g_fake.destroy_fence_count);
+        g_failures++;
+    }
+    if (g_fake.create_shader_count != g_fake.destroy_shader_count ||
+        g_fake.create_descriptor_layout_count !=
+            g_fake.destroy_descriptor_layout_count ||
+        g_fake.create_pipeline_layout_count !=
+            g_fake.destroy_pipeline_layout_count ||
+        g_fake.create_pipeline_count != g_fake.destroy_pipeline_count ||
+        g_fake.create_descriptor_pool_count !=
+            g_fake.destroy_descriptor_pool_count) {
+        fprintf(stderr,
+            "FAIL: %s: leaked fake compute owners: shader=%u/%u "
+            "descriptorLayout=%u/%u pipelineLayout=%u/%u pipeline=%u/%u "
+            "descriptorPool=%u/%u\n", where,
+            g_fake.create_shader_count, g_fake.destroy_shader_count,
+            g_fake.create_descriptor_layout_count,
+            g_fake.destroy_descriptor_layout_count,
+            g_fake.create_pipeline_layout_count,
+            g_fake.destroy_pipeline_layout_count,
+            g_fake.create_pipeline_count, g_fake.destroy_pipeline_count,
+            g_fake.create_descriptor_pool_count,
+            g_fake.destroy_descriptor_pool_count);
         g_failures++;
     }
 }
@@ -235,6 +282,17 @@ static VKAPI_ATTR void VKAPI_CALL fake_GetPhysicalDeviceProperties(
     }
     properties->limits.maxMemoryAllocationCount = g_fake.max_allocations;
     properties->limits.minStorageBufferOffsetAlignment = g_fake.storage_alignment;
+    properties->limits.maxStorageBufferRange = UINT32_MAX;
+    properties->limits.maxPushConstantsSize = 128;
+    properties->limits.maxComputeWorkGroupInvocations = 256;
+    properties->limits.maxComputeWorkGroupSize[0] = 256;
+    properties->limits.maxComputeWorkGroupSize[1] = 256;
+    properties->limits.maxComputeWorkGroupSize[2] = 64;
+    properties->limits.maxComputeWorkGroupCount[0] = 65535;
+    properties->limits.maxComputeWorkGroupCount[1] = 65535;
+    properties->limits.maxComputeWorkGroupCount[2] = 65535;
+    properties->limits.maxPerStageDescriptorStorageBuffers = 8;
+    properties->limits.maxDescriptorSetStorageBuffers = 8;
 }
 
 static void fill_memory_properties(VkPhysicalDeviceMemoryProperties *properties) {
@@ -586,35 +644,321 @@ static VKAPI_ATTR VkResult VKAPI_CALL fake_WaitForFences(
     return VK_SUCCESS;
 }
 
+static VKAPI_ATTR void VKAPI_CALL fake_CmdPipelineBarrier(
+    VkCommandBuffer command,
+    VkPipelineStageFlags source_stage,
+    VkPipelineStageFlags destination_stage,
+    VkDependencyFlags dependency_flags,
+    uint32_t memory_barrier_count,
+    const VkMemoryBarrier *memory_barriers,
+    uint32_t buffer_barrier_count,
+    const VkBufferMemoryBarrier *buffer_barriers,
+    uint32_t image_barrier_count,
+    const VkImageMemoryBarrier *image_barriers
+) {
+    (void)command; (void)dependency_flags; (void)memory_barrier_count;
+    (void)memory_barriers; (void)image_barrier_count; (void)image_barriers;
+    g_fake.pipeline_barrier_count++;
+    if (buffer_barrier_count == 1 && buffer_barriers &&
+        source_stage == VK_PIPELINE_STAGE_HOST_BIT &&
+        destination_stage == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT &&
+        buffer_barriers[0].srcAccessMask == VK_ACCESS_HOST_WRITE_BIT &&
+        buffer_barriers[0].dstAccessMask == VK_ACCESS_SHADER_READ_BIT)
+        g_fake.host_to_compute_barrier_count++;
+    if (buffer_barrier_count == 1 && buffer_barriers &&
+        source_stage == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT &&
+        destination_stage == VK_PIPELINE_STAGE_HOST_BIT &&
+        buffer_barriers[0].srcAccessMask == VK_ACCESS_SHADER_WRITE_BIT &&
+        buffer_barriers[0].dstAccessMask == VK_ACCESS_HOST_READ_BIT)
+        g_fake.compute_to_host_barrier_count++;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_CmdBindPipeline(
+    VkCommandBuffer command,
+    VkPipelineBindPoint bind_point,
+    VkPipeline pipeline
+) {
+    (void)command; (void)bind_point; (void)pipeline;
+    g_fake.bind_pipeline_count++;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_CmdBindDescriptorSets(
+    VkCommandBuffer command,
+    VkPipelineBindPoint bind_point,
+    VkPipelineLayout layout,
+    uint32_t first_set,
+    uint32_t set_count,
+    const VkDescriptorSet *sets,
+    uint32_t dynamic_offset_count,
+    const uint32_t *dynamic_offsets
+) {
+    (void)command; (void)bind_point; (void)layout; (void)first_set;
+    (void)set_count; (void)sets; (void)dynamic_offset_count;
+    (void)dynamic_offsets;
+    g_fake.bind_descriptor_count++;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_CmdPushConstants(
+    VkCommandBuffer command,
+    VkPipelineLayout layout,
+    VkShaderStageFlags stage_flags,
+    uint32_t offset,
+    uint32_t size,
+    const void *values
+) {
+    (void)command; (void)layout; (void)stage_flags;
+    if (offset == 0 && size == sizeof(g_fake.push_constants) && values)
+        memcpy(g_fake.push_constants, values, size);
+    g_fake.push_constant_count++;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_CmdDispatch(
+    VkCommandBuffer command,
+    uint32_t group_count_x,
+    uint32_t group_count_y,
+    uint32_t group_count_z
+) {
+    (void)command; (void)group_count_x; (void)group_count_y;
+    (void)group_count_z;
+    g_fake.dispatch_count++;
+    FakeBuffer *packed_buffer = find_buffer(g_fake.descriptor_buffers[0]);
+    FakeBuffer *input_buffer = find_buffer(g_fake.descriptor_buffers[1]);
+    FakeBuffer *output_buffer = find_buffer(g_fake.descriptor_buffers[2]);
+    FakeMemory *packed_memory = packed_buffer
+        ? find_memory(packed_buffer->memory) : NULL;
+    FakeMemory *input_memory = input_buffer
+        ? find_memory(input_buffer->memory) : NULL;
+    FakeMemory *output_memory = output_buffer
+        ? find_memory(output_buffer->memory) : NULL;
+    if (!packed_memory || !input_memory || !output_memory) return;
+    uint32_t I = g_fake.push_constants[0];
+    uint32_t O = g_fake.push_constants[1];
+    uint32_t rows = g_fake.push_constants[2];
+    uint32_t row_words = g_fake.push_constants[3];
+    uint32_t scale_words = g_fake.push_constants[4];
+    uint32_t total = g_fake.push_constants[5];
+    if ((uint64_t)total != (uint64_t)rows * O) return;
+    const uint32_t *packed = (const uint32_t *)packed_memory->data;
+    const float *input = (const float *)input_memory->data;
+    float *output = (float *)output_memory->data;
+    for (uint32_t index = 0; index < total; index++) {
+        uint32_t row = index / O, column = index % O;
+        float sum = 0;
+        for (uint32_t word = 0; word < row_words; word++) {
+            uint32_t bits = packed[column * row_words + word];
+            for (uint32_t nibble = 0; nibble < 8; nibble++)
+                sum += input[(uint64_t)row * I + word * 8 + nibble] *
+                    (float)((int)((bits >> (nibble * 4)) & 15u) - 8);
+        }
+        float scale;
+        memcpy(&scale, &packed[scale_words + column], sizeof(scale));
+        output[index] = sum * scale;
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_CreateShaderModule(
+    VkDevice device,
+    const VkShaderModuleCreateInfo *info,
+    const VkAllocationCallbacks *callbacks,
+    VkShaderModule *module
+) {
+    (void)device; (void)info; (void)callbacks;
+    VkResult result = maybe_fault(FP_CREATE_SHADER);
+    if (result != VK_SUCCESS) return result;
+    *module = HANDLE(VkShaderModule, next_handle());
+    g_fake.create_shader_count++;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_DestroyShaderModule(
+    VkDevice device,
+    VkShaderModule module,
+    const VkAllocationCallbacks *callbacks
+) {
+    (void)device; (void)module; (void)callbacks;
+    g_fake.destroy_shader_count++;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_CreateDescriptorSetLayout(
+    VkDevice device,
+    const VkDescriptorSetLayoutCreateInfo *info,
+    const VkAllocationCallbacks *callbacks,
+    VkDescriptorSetLayout *layout
+) {
+    (void)device; (void)info; (void)callbacks;
+    VkResult result = maybe_fault(FP_CREATE_DESCRIPTOR_LAYOUT);
+    if (result != VK_SUCCESS) return result;
+    *layout = HANDLE(VkDescriptorSetLayout, next_handle());
+    g_fake.create_descriptor_layout_count++;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_DestroyDescriptorSetLayout(
+    VkDevice device,
+    VkDescriptorSetLayout layout,
+    const VkAllocationCallbacks *callbacks
+) {
+    (void)device; (void)layout; (void)callbacks;
+    g_fake.destroy_descriptor_layout_count++;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_CreatePipelineLayout(
+    VkDevice device,
+    const VkPipelineLayoutCreateInfo *info,
+    const VkAllocationCallbacks *callbacks,
+    VkPipelineLayout *layout
+) {
+    (void)device; (void)info; (void)callbacks;
+    VkResult result = maybe_fault(FP_CREATE_PIPELINE_LAYOUT);
+    if (result != VK_SUCCESS) return result;
+    *layout = HANDLE(VkPipelineLayout, next_handle());
+    g_fake.create_pipeline_layout_count++;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_DestroyPipelineLayout(
+    VkDevice device,
+    VkPipelineLayout layout,
+    const VkAllocationCallbacks *callbacks
+) {
+    (void)device; (void)layout; (void)callbacks;
+    g_fake.destroy_pipeline_layout_count++;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_CreateComputePipelines(
+    VkDevice device,
+    VkPipelineCache cache,
+    uint32_t count,
+    const VkComputePipelineCreateInfo *infos,
+    const VkAllocationCallbacks *callbacks,
+    VkPipeline *pipelines
+) {
+    (void)device; (void)cache; (void)infos; (void)callbacks;
+    VkResult result = maybe_fault(FP_CREATE_PIPELINE);
+    if (result != VK_SUCCESS) return result;
+    for (uint32_t i = 0; i < count; i++)
+        pipelines[i] = HANDLE(VkPipeline, next_handle());
+    g_fake.create_pipeline_count += count;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_DestroyPipeline(
+    VkDevice device,
+    VkPipeline pipeline,
+    const VkAllocationCallbacks *callbacks
+) {
+    (void)device; (void)pipeline; (void)callbacks;
+    g_fake.destroy_pipeline_count++;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_CreateDescriptorPool(
+    VkDevice device,
+    const VkDescriptorPoolCreateInfo *info,
+    const VkAllocationCallbacks *callbacks,
+    VkDescriptorPool *pool
+) {
+    (void)device; (void)info; (void)callbacks;
+    VkResult result = maybe_fault(FP_CREATE_DESCRIPTOR_POOL);
+    if (result != VK_SUCCESS) return result;
+    *pool = HANDLE(VkDescriptorPool, next_handle());
+    g_fake.create_descriptor_pool_count++;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_DestroyDescriptorPool(
+    VkDevice device,
+    VkDescriptorPool pool,
+    const VkAllocationCallbacks *callbacks
+) {
+    (void)device; (void)pool; (void)callbacks;
+    g_fake.destroy_descriptor_pool_count++;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fake_AllocateDescriptorSets(
+    VkDevice device,
+    const VkDescriptorSetAllocateInfo *info,
+    VkDescriptorSet *sets
+) {
+    (void)device;
+    VkResult result = maybe_fault(FP_ALLOCATE_DESCRIPTOR_SET);
+    if (result != VK_SUCCESS) return result;
+    for (uint32_t i = 0; i < info->descriptorSetCount; i++)
+        sets[i] = HANDLE(VkDescriptorSet, next_handle());
+    g_fake.allocate_descriptor_set_count += info->descriptorSetCount;
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL fake_UpdateDescriptorSets(
+    VkDevice device,
+    uint32_t write_count,
+    const VkWriteDescriptorSet *writes,
+    uint32_t copy_count,
+    const VkCopyDescriptorSet *copies
+) {
+    (void)device; (void)copy_count; (void)copies;
+    unsigned active = __sync_add_and_fetch(&g_fake.api_active, 1);
+    unsigned old_max = g_fake.api_max_active;
+    while (active > old_max && !__sync_bool_compare_and_swap(
+        &g_fake.api_max_active, old_max, active))
+        old_max = g_fake.api_max_active;
+    sched_yield();
+    for (uint32_t i = 0; i < write_count; i++) {
+        if (writes[i].dstBinding < 3 && writes[i].pBufferInfo) {
+            uint32_t binding = writes[i].dstBinding;
+            g_fake.descriptor_buffers[binding] = writes[i].pBufferInfo->buffer;
+            g_fake.descriptor_ranges[binding] = writes[i].pBufferInfo->range;
+        }
+    }
+    g_fake.update_descriptor_count++;
+    __sync_sub_and_fetch(&g_fake.api_active, 1);
+}
+
 static const ColiVulkanApi g_fake_api = {
-    fake_CreateInstance,
-    fake_DestroyInstance,
-    fake_EnumeratePhysicalDevices,
-    fake_GetPhysicalDeviceProperties,
-    fake_GetPhysicalDeviceMemoryProperties,
-    fake_GetPhysicalDeviceQueueFamilyProperties,
-    fake_CreateDevice,
-    fake_DestroyDevice,
-    fake_GetDeviceQueue,
-    fake_CreateCommandPool,
-    fake_DestroyCommandPool,
-    fake_CreateBuffer,
-    fake_DestroyBuffer,
-    fake_GetBufferMemoryRequirements,
-    fake_AllocateMemory,
-    fake_FreeMemory,
-    fake_BindBufferMemory,
-    fake_MapMemory,
-    fake_UnmapMemory,
-    fake_AllocateCommandBuffers,
-    fake_FreeCommandBuffers,
-    fake_BeginCommandBuffer,
-    fake_EndCommandBuffer,
-    fake_CmdCopyBuffer,
-    fake_CreateFence,
-    fake_DestroyFence,
-    fake_QueueSubmit,
-    fake_WaitForFences
+    .CreateInstance = fake_CreateInstance,
+    .DestroyInstance = fake_DestroyInstance,
+    .EnumeratePhysicalDevices = fake_EnumeratePhysicalDevices,
+    .GetPhysicalDeviceProperties = fake_GetPhysicalDeviceProperties,
+    .GetPhysicalDeviceMemoryProperties = fake_GetPhysicalDeviceMemoryProperties,
+    .GetPhysicalDeviceQueueFamilyProperties = fake_GetPhysicalDeviceQueueFamilyProperties,
+    .CreateDevice = fake_CreateDevice,
+    .DestroyDevice = fake_DestroyDevice,
+    .GetDeviceQueue = fake_GetDeviceQueue,
+    .CreateCommandPool = fake_CreateCommandPool,
+    .DestroyCommandPool = fake_DestroyCommandPool,
+    .CreateBuffer = fake_CreateBuffer,
+    .DestroyBuffer = fake_DestroyBuffer,
+    .GetBufferMemoryRequirements = fake_GetBufferMemoryRequirements,
+    .AllocateMemory = fake_AllocateMemory,
+    .FreeMemory = fake_FreeMemory,
+    .BindBufferMemory = fake_BindBufferMemory,
+    .MapMemory = fake_MapMemory,
+    .UnmapMemory = fake_UnmapMemory,
+    .AllocateCommandBuffers = fake_AllocateCommandBuffers,
+    .FreeCommandBuffers = fake_FreeCommandBuffers,
+    .BeginCommandBuffer = fake_BeginCommandBuffer,
+    .EndCommandBuffer = fake_EndCommandBuffer,
+    .CmdCopyBuffer = fake_CmdCopyBuffer,
+    .CmdPipelineBarrier = fake_CmdPipelineBarrier,
+    .CmdBindPipeline = fake_CmdBindPipeline,
+    .CmdBindDescriptorSets = fake_CmdBindDescriptorSets,
+    .CmdPushConstants = fake_CmdPushConstants,
+    .CmdDispatch = fake_CmdDispatch,
+    .CreateFence = fake_CreateFence,
+    .DestroyFence = fake_DestroyFence,
+    .QueueSubmit = fake_QueueSubmit,
+    .WaitForFences = fake_WaitForFences,
+    .CreateShaderModule = fake_CreateShaderModule,
+    .DestroyShaderModule = fake_DestroyShaderModule,
+    .CreateDescriptorSetLayout = fake_CreateDescriptorSetLayout,
+    .DestroyDescriptorSetLayout = fake_DestroyDescriptorSetLayout,
+    .CreatePipelineLayout = fake_CreatePipelineLayout,
+    .DestroyPipelineLayout = fake_DestroyPipelineLayout,
+    .CreateComputePipelines = fake_CreateComputePipelines,
+    .DestroyPipeline = fake_DestroyPipeline,
+    .CreateDescriptorPool = fake_CreateDescriptorPool,
+    .DestroyDescriptorPool = fake_DestroyDescriptorPool,
+    .AllocateDescriptorSets = fake_AllocateDescriptorSets,
+    .UpdateDescriptorSets = fake_UpdateDescriptorSets
 };
 
 static ColiVulkanConfig fake_config(uint64_t budget) {

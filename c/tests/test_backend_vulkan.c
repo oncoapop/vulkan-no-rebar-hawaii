@@ -1,6 +1,7 @@
 #include "../backend_vulkan.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,12 +19,134 @@ static int fail_result(const char *what, ColiVulkanResult result) {
     return 1;
 }
 
+static int run_compute_hardware(ColiVulkanContext *context) {
+    enum { I = 32, O = 128, MAX_ROWS = 64 };
+    ColiVulkanComputeConfig compute = {MAX_ROWS, I, O};
+    ColiVulkanResult result = coli_vulkan_compute_prepare(context, &compute);
+    if (result != COLI_VULKAN_OK) return fail_result("compute prepare", result);
+    ColiVulkanContextInfo context_info;
+    result = coli_vulkan_context_get_info(context, &context_info);
+    if (result != COLI_VULKAN_OK) return fail_result("compute info", result);
+    VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!context_info.compute_prepared || context_info.compute_max_rows != 64 ||
+        (context_info.compute_input_memory_property_flags & required) != required ||
+        (context_info.compute_output_memory_property_flags & required) != required ||
+        (context_info.compute_input_memory_property_flags &
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+        (context_info.compute_output_memory_property_flags &
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+        context_info.compute_input_heap_index == 2 ||
+        context_info.compute_output_heap_index == 2 ||
+        context_info.compute_input_memory_type_index == 3 ||
+        context_info.compute_input_memory_type_index == 4 ||
+        context_info.compute_output_memory_type_index == 3 ||
+        context_info.compute_output_memory_type_index == 4) {
+        fprintf(stderr, "FAIL: compute scratch selected BAR/device-local memory\n");
+        return 1;
+    }
+    printf("compute scratch inputType=%u inputHeap=%u inputFlags=0x%04x "
+           "outputType=%u outputHeap=%u outputFlags=0x%04x\n",
+        context_info.compute_input_memory_type_index,
+        context_info.compute_input_heap_index,
+        context_info.compute_input_memory_property_flags,
+        context_info.compute_output_memory_type_index,
+        context_info.compute_output_heap_index,
+        context_info.compute_output_memory_property_flags);
+
+    uint8_t weights[O * I / 2];
+    float scales[O];
+    for (uint32_t o = 0; o < O; o++) {
+        scales[o] = 0.001f * (float)(o + 1);
+        for (uint32_t i = 0; i < I; i += 2) {
+            uint8_t low = (uint8_t)((o + 3 * i) & 15u);
+            uint8_t high = (uint8_t)((5 * o + i + 1) & 15u);
+            weights[o * (I / 2) + i / 2] =
+                (uint8_t)(low | (uint8_t)(high << 4));
+        }
+    }
+    ColiVulkanQTSpec spec = {2, I, O, 0, weights, sizeof(weights), scales,
+        sizeof(scales)};
+    ColiVulkanTensor *tensor = NULL;
+    result = coli_vulkan_tensor_create_qt(context, &tensor, &spec,
+        FENCE_TIMEOUT_NS);
+    if (result != COLI_VULKAN_OK || !tensor)
+        return fail_result("compute tensor upload", result);
+    ColiVulkanTensorInfo tensor_info;
+    result = coli_vulkan_tensor_get_info(tensor, &tensor_info);
+    if (result != COLI_VULKAN_OK || !tensor_info.compute_eligible) {
+        (void)coli_vulkan_tensor_free(context, &tensor);
+        return fail_result("compute tensor eligibility",
+            result == COLI_VULKAN_OK ? COLI_VULKAN_ERROR : result);
+    }
+
+    const uint32_t row_cases[] = {1, 4, 12};
+    float input[12 * I], actual[12 * O], expected[12 * O];
+    for (size_t i = 0; i < sizeof(input) / sizeof(input[0]); i++)
+        input[i] = (float)((int)(i % 29) - 14) / 19.0f;
+    for (size_t c = 0; c < sizeof(row_cases) / sizeof(row_cases[0]); c++) {
+        uint32_t rows = row_cases[c];
+        for (uint32_t row = 0; row < rows; row++) for (uint32_t o = 0; o < O; o++) {
+            float sum = 0;
+            for (uint32_t i = 0; i < I; i++) {
+                uint8_t byte = weights[o * (I / 2) + i / 2];
+                int weight = (int)((i & 1u) ? byte >> 4 : byte & 15u) - 8;
+                sum += input[row * I + i] * (float)weight;
+            }
+            expected[row * O + o] = sum * scales[o];
+        }
+        memset(actual, 0xa5, sizeof(actual));
+        result = coli_vulkan_tensor_matmul_fmt2(context, tensor, input, rows,
+            actual, FENCE_TIMEOUT_NS);
+        if (result != COLI_VULKAN_OK) {
+            if (result == COLI_VULKAN_TIMEOUT)
+                (void)coli_vulkan_finish_pending(context, FENCE_TIMEOUT_NS);
+            (void)coli_vulkan_tensor_free(context, &tensor);
+            return fail_result("compute dispatch", result);
+        }
+        for (uint32_t i = 0; i < rows * O; i++) {
+            float absolute = fabsf(actual[i] - expected[i]);
+            float magnitude = fmaxf(fabsf(actual[i]), fabsf(expected[i]));
+            if (!isfinite(actual[i]) ||
+                absolute > 5e-5f + 5e-4f * magnitude) {
+                fprintf(stderr,
+                    "FAIL: compute numerical mismatch rows=%u index=%u "
+                    "actual=%.9g expected=%.9g\n",
+                    rows, i, actual[i], expected[i]);
+                (void)coli_vulkan_tensor_free(context, &tensor);
+                return 1;
+            }
+        }
+        printf("compute rows=%u exact-format2-within-tolerance\n", rows);
+    }
+    result = coli_vulkan_tensor_free(context, &tensor);
+    if (result != COLI_VULKAN_OK) return fail_result("compute tensor free", result);
+    result = coli_vulkan_context_get_info(context, &context_info);
+    if (result != COLI_VULKAN_OK) return fail_result("final compute info", result);
+    if (context_info.compute_dispatch_recorded != 3 ||
+        context_info.compute_submitted != 3 ||
+        context_info.compute_completed != 3 ||
+        context_info.compute_rows_completed != 17 ||
+        context_info.compute_timeouts || context_info.compute_errors ||
+        context_info.compute_device_lost || context_info.pending_operations ||
+        context_info.live_tensors != 0) {
+        fprintf(stderr, "FAIL: strict compute telemetry/lifecycle mismatch\n");
+        return 1;
+    }
+    printf("compute dispatches=3 submitted=3 completed=3 rows=17 pending=0\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int strict = 0;
+    int compute_strict = 0;
     if (argc == 2 && strcmp(argv[1], "--strict") == 0) {
         strict = 1;
+    } else if (argc == 2 && strcmp(argv[1], "--compute-strict") == 0) {
+        strict = 1;
+        compute_strict = 1;
     } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--strict]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--strict|--compute-strict]\n", argv[0]);
         return 2;
     }
     int failed = 0;
@@ -247,6 +370,10 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
+    if (compute_strict && run_compute_hardware(context)) {
+        failed = 1;
+        goto cleanup;
+    }
 
 cleanup:
     result = coli_vulkan_context_destroy(&context, FENCE_TIMEOUT_NS);
@@ -255,6 +382,8 @@ cleanup:
             coli_vulkan_result_string(result));
         failed = 1;
     }
-    if (!failed) printf("PASS: persistent Vulkan Phase 3B validated QT hardware lifecycle\n");
+    if (!failed) printf(compute_strict
+        ? "PASS: Vulkan Phase 4A strict R9 390 format-2 compute lifecycle\n"
+        : "PASS: persistent Vulkan Phase 3B validated QT hardware lifecycle\n");
     return failed ? 1 : 0;
 }

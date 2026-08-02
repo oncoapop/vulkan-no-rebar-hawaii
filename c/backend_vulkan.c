@@ -1,4 +1,5 @@
 #include "backend_vulkan.h"
+#include "shaders/vulkan_qt_fmt2_down_spv.h"
 
 #include <errno.h>
 #include <float.h>
@@ -36,48 +37,83 @@ typedef struct {
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
     PFN_vkEndCommandBuffer EndCommandBuffer;
     PFN_vkCmdCopyBuffer CmdCopyBuffer;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdBindPipeline CmdBindPipeline;
+    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
+    PFN_vkCmdPushConstants CmdPushConstants;
+    PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCreateFence CreateFence;
     PFN_vkDestroyFence DestroyFence;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkWaitForFences WaitForFences;
+    PFN_vkCreateShaderModule CreateShaderModule;
+    PFN_vkDestroyShaderModule DestroyShaderModule;
+    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
+    PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout;
+    PFN_vkCreatePipelineLayout CreatePipelineLayout;
+    PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
+    PFN_vkCreateComputePipelines CreateComputePipelines;
+    PFN_vkDestroyPipeline DestroyPipeline;
+    PFN_vkCreateDescriptorPool CreateDescriptorPool;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
+    PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
 } VulkanApi;
 #endif
 
 static const VulkanApi g_real_api = {
-    vkCreateInstance,
-    vkDestroyInstance,
-    vkEnumeratePhysicalDevices,
-    vkGetPhysicalDeviceProperties,
-    vkGetPhysicalDeviceMemoryProperties,
-    vkGetPhysicalDeviceQueueFamilyProperties,
-    vkCreateDevice,
-    vkDestroyDevice,
-    vkGetDeviceQueue,
-    vkCreateCommandPool,
-    vkDestroyCommandPool,
-    vkCreateBuffer,
-    vkDestroyBuffer,
-    vkGetBufferMemoryRequirements,
-    vkAllocateMemory,
-    vkFreeMemory,
-    vkBindBufferMemory,
-    vkMapMemory,
-    vkUnmapMemory,
-    vkAllocateCommandBuffers,
-    vkFreeCommandBuffers,
-    vkBeginCommandBuffer,
-    vkEndCommandBuffer,
-    vkCmdCopyBuffer,
-    vkCreateFence,
-    vkDestroyFence,
-    vkQueueSubmit,
-    vkWaitForFences
+    .CreateInstance = vkCreateInstance,
+    .DestroyInstance = vkDestroyInstance,
+    .EnumeratePhysicalDevices = vkEnumeratePhysicalDevices,
+    .GetPhysicalDeviceProperties = vkGetPhysicalDeviceProperties,
+    .GetPhysicalDeviceMemoryProperties = vkGetPhysicalDeviceMemoryProperties,
+    .GetPhysicalDeviceQueueFamilyProperties = vkGetPhysicalDeviceQueueFamilyProperties,
+    .CreateDevice = vkCreateDevice,
+    .DestroyDevice = vkDestroyDevice,
+    .GetDeviceQueue = vkGetDeviceQueue,
+    .CreateCommandPool = vkCreateCommandPool,
+    .DestroyCommandPool = vkDestroyCommandPool,
+    .CreateBuffer = vkCreateBuffer,
+    .DestroyBuffer = vkDestroyBuffer,
+    .GetBufferMemoryRequirements = vkGetBufferMemoryRequirements,
+    .AllocateMemory = vkAllocateMemory,
+    .FreeMemory = vkFreeMemory,
+    .BindBufferMemory = vkBindBufferMemory,
+    .MapMemory = vkMapMemory,
+    .UnmapMemory = vkUnmapMemory,
+    .AllocateCommandBuffers = vkAllocateCommandBuffers,
+    .FreeCommandBuffers = vkFreeCommandBuffers,
+    .BeginCommandBuffer = vkBeginCommandBuffer,
+    .EndCommandBuffer = vkEndCommandBuffer,
+    .CmdCopyBuffer = vkCmdCopyBuffer,
+    .CmdPipelineBarrier = vkCmdPipelineBarrier,
+    .CmdBindPipeline = vkCmdBindPipeline,
+    .CmdBindDescriptorSets = vkCmdBindDescriptorSets,
+    .CmdPushConstants = vkCmdPushConstants,
+    .CmdDispatch = vkCmdDispatch,
+    .CreateFence = vkCreateFence,
+    .DestroyFence = vkDestroyFence,
+    .QueueSubmit = vkQueueSubmit,
+    .WaitForFences = vkWaitForFences,
+    .CreateShaderModule = vkCreateShaderModule,
+    .DestroyShaderModule = vkDestroyShaderModule,
+    .CreateDescriptorSetLayout = vkCreateDescriptorSetLayout,
+    .DestroyDescriptorSetLayout = vkDestroyDescriptorSetLayout,
+    .CreatePipelineLayout = vkCreatePipelineLayout,
+    .DestroyPipelineLayout = vkDestroyPipelineLayout,
+    .CreateComputePipelines = vkCreateComputePipelines,
+    .DestroyPipeline = vkDestroyPipeline,
+    .CreateDescriptorPool = vkCreateDescriptorPool,
+    .DestroyDescriptorPool = vkDestroyDescriptorPool,
+    .AllocateDescriptorSets = vkAllocateDescriptorSets,
+    .UpdateDescriptorSets = vkUpdateDescriptorSets
 };
 
 typedef enum {
     PENDING_NONE = 0,
     PENDING_UPLOAD = 1,
-    PENDING_READBACK = 2
+    PENDING_READBACK = 2,
+    PENDING_COMPUTE = 3
 } PendingKind;
 
 struct ColiVulkanTensor {
@@ -98,6 +134,7 @@ struct ColiVulkanTensor {
     uint32_t memory_type_index;
     uint32_t heap_index;
     VkMemoryPropertyFlags memory_property_flags;
+    int compute_eligible;
     ColiVulkanTensorState state;
     int destroy_requested;
     struct ColiVulkanTensor *next;
@@ -107,7 +144,35 @@ typedef struct {
     PendingKind kind;
     VulkanUploadOp op;
     ColiVulkanTensor *tensor;
+    uint32_t compute_rows;
 } PendingOperation;
+
+typedef struct {
+    int prepared;
+    uint32_t max_rows;
+    uint32_t input_width;
+    uint32_t output_width;
+    VkShaderModule shader_module;
+    VkDescriptorSetLayout descriptor_set_layout;
+    VkPipelineLayout pipeline_layout;
+    VkPipeline pipeline;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSet descriptor_set;
+    VkBuffer input_buffer;
+    VkDeviceMemory input_memory;
+    void *input_mapping;
+    VkDeviceSize input_allocation_size;
+    uint32_t input_memory_type_index;
+    uint32_t input_heap_index;
+    VkMemoryPropertyFlags input_memory_property_flags;
+    VkBuffer output_buffer;
+    VkDeviceMemory output_memory;
+    void *output_mapping;
+    VkDeviceSize output_allocation_size;
+    uint32_t output_memory_type_index;
+    uint32_t output_heap_index;
+    VkMemoryPropertyFlags output_memory_property_flags;
+} ComputeState;
 
 struct ColiVulkanContext {
     const VulkanApi *api;
@@ -133,6 +198,17 @@ struct ColiVulkanContext {
     int shutting_down;
     ColiVulkanTensor *tensors;
     PendingOperation pending;
+    ComputeState compute;
+    uint64_t compute_dispatch_recorded;
+    uint64_t compute_submitted;
+    uint64_t compute_completed;
+    uint64_t compute_rows_completed;
+    uint64_t compute_timeouts;
+    uint64_t compute_errors;
+    uint64_t compute_device_lost;
+#ifdef COLI_VULKAN_TESTING
+    int test_force_big_endian;
+#endif
 };
 
 static pthread_mutex_t g_context_gate = PTHREAD_MUTEX_INITIALIZER;
@@ -151,6 +227,18 @@ static int api_complete(const VulkanApi *api) {
         api->FreeCommandBuffers && api->BeginCommandBuffer &&
         api->EndCommandBuffer && api->CmdCopyBuffer && api->CreateFence &&
         api->DestroyFence && api->QueueSubmit && api->WaitForFences;
+}
+
+static int compute_api_complete(const VulkanApi *api) {
+    return api_complete(api) && api->CmdPipelineBarrier &&
+        api->CmdBindPipeline && api->CmdBindDescriptorSets &&
+        api->CmdPushConstants && api->CmdDispatch && api->CreateShaderModule &&
+        api->DestroyShaderModule && api->CreateDescriptorSetLayout &&
+        api->DestroyDescriptorSetLayout && api->CreatePipelineLayout &&
+        api->DestroyPipelineLayout && api->CreateComputePipelines &&
+        api->DestroyPipeline && api->CreateDescriptorPool &&
+        api->DestroyDescriptorPool && api->AllocateDescriptorSets &&
+        api->UpdateDescriptorSets;
 }
 
 static const VulkanApi *config_api(const ColiVulkanConfig *config) {
@@ -717,6 +805,9 @@ ColiVulkanResult coli_vulkan_context_create(
     context->api = api;
     context->requested_budget_bytes = config->expert_budget_bytes;
     context->upload_timeout_ns = config->upload_timeout_ns;
+#ifdef COLI_VULKAN_TESTING
+    context->test_force_big_endian = config->test_force_big_endian != 0;
+#endif
     if (pthread_mutex_init(&context->mutex, NULL) != 0) {
         free(context);
         context_clear_gate();
@@ -1042,29 +1133,34 @@ static ColiVulkanResult finish_pending_locked(
     uint64_t timeout_ns
 ) {
     if (context->pending.kind == PENDING_NONE) return COLI_VULKAN_OK;
+    if (context->device_lost) return COLI_VULKAN_DEVICE_LOST;
+    PendingKind kind = context->pending.kind;
     VulkanUploadResult upload_result = vulkan_upload_finish(&context->pending.op,
         timeout_ns);
     if (upload_result == VULKAN_UPLOAD_TIMEOUT) return COLI_VULKAN_TIMEOUT;
     if (upload_result == VULKAN_UPLOAD_DEVICE_LOST) {
+        if (kind == PENDING_COMPUTE) context->compute_device_lost++;
         context_mark_device_lost(context);
-        if (context->pending.tensor)
+        if (context->pending.tensor && kind == PENDING_UPLOAD)
             context->pending.tensor->state = COLI_VULKAN_TENSOR_FAILED;
         return COLI_VULKAN_DEVICE_LOST;
     }
     if (upload_result != VULKAN_UPLOAD_SUCCESS) {
+        if (kind == PENDING_COMPUTE) context->compute_errors++;
         context->degraded = 1;
         context->usable = 0;
-        if (context->pending.tensor && context->pending.kind == PENDING_UPLOAD)
+        if (context->pending.tensor && kind == PENDING_UPLOAD)
             context->pending.tensor->state = COLI_VULKAN_TENSOR_FAILED;
         return COLI_VULKAN_ERROR;
     }
 
-    if (context->live_allocations) context->live_allocations--;
+    if (kind != PENDING_COMPUTE && context->live_allocations)
+        context->live_allocations--;
     ColiVulkanTensor *tensor = context->pending.tensor;
-    PendingKind kind = context->pending.kind;
     memset(&context->pending, 0, sizeof(context->pending));
     if (tensor && kind == PENDING_UPLOAD)
         tensor->state = COLI_VULKAN_TENSOR_READY;
+    if (kind == PENDING_COMPUTE) context->compute_completed++;
     if (tensor && tensor->destroy_requested)
         tensor_destroy_locked(context, tensor);
     context->degraded = 0;
@@ -1214,6 +1310,14 @@ ColiVulkanResult coli_vulkan_tensor_create_qt(
         tensor->source_weight_bytes = spec->weight_bytes;
         tensor->source_scale_bytes = spec->scale_bytes;
         tensor->uploaded_scale_bytes = validated.uploaded_scale_bytes;
+        tensor->compute_eligible = spec->fmt == 2 && spec->gs == 0 &&
+            spec->I <= UINT32_MAX && spec->O <= UINT32_MAX &&
+            spec->I % 8 == 0 && validated.packed.weight_offset == 0 &&
+            validated.packed.weight_size == spec->O * (spec->I / 2) &&
+            validated.packed.scale_offset % 4 == 0 &&
+            validated.packed.scale_size == spec->O * sizeof(float) &&
+            (tensor->memory_property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            !(tensor->memory_property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     }
     return result;
 }
@@ -1230,6 +1334,539 @@ static uint32_t find_host_memory_type(
             return i;
     }
     return UINT32_MAX;
+}
+
+static uint32_t find_system_host_memory_type(
+    const VkPhysicalDeviceMemoryProperties *properties,
+    uint32_t memory_type_bits,
+    uint32_t *heap_index,
+    VkMemoryPropertyFlags *property_flags
+) {
+    for (uint32_t i = 0; i < properties->memoryTypeCount; i++) {
+        VkMemoryPropertyFlags flags = properties->memoryTypes[i].propertyFlags;
+        uint32_t heap = properties->memoryTypes[i].heapIndex;
+        if (!(memory_type_bits & (1u << i)) ||
+            (flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+            (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+            heap >= properties->memoryHeapCount ||
+            (properties->memoryHeaps[heap].flags &
+                VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            continue;
+        *heap_index = heap;
+        *property_flags = flags;
+        return i;
+    }
+    return UINT32_MAX;
+}
+
+static void compute_cleanup_locked(ColiVulkanContext *context) {
+    ComputeState *compute = &context->compute;
+    if (compute->output_mapping && compute->output_memory)
+        context->api->UnmapMemory(context->device, compute->output_memory);
+    if (compute->output_buffer)
+        context->api->DestroyBuffer(context->device, compute->output_buffer, NULL);
+    if (compute->output_memory) {
+        context->api->FreeMemory(context->device, compute->output_memory, NULL);
+        if (context->live_allocations) context->live_allocations--;
+    }
+    if (compute->input_mapping && compute->input_memory)
+        context->api->UnmapMemory(context->device, compute->input_memory);
+    if (compute->input_buffer)
+        context->api->DestroyBuffer(context->device, compute->input_buffer, NULL);
+    if (compute->input_memory) {
+        context->api->FreeMemory(context->device, compute->input_memory, NULL);
+        if (context->live_allocations) context->live_allocations--;
+    }
+    if (compute->descriptor_pool)
+        context->api->DestroyDescriptorPool(context->device,
+            compute->descriptor_pool, NULL);
+    if (compute->pipeline)
+        context->api->DestroyPipeline(context->device, compute->pipeline, NULL);
+    if (compute->pipeline_layout)
+        context->api->DestroyPipelineLayout(context->device,
+            compute->pipeline_layout, NULL);
+    if (compute->descriptor_set_layout)
+        context->api->DestroyDescriptorSetLayout(context->device,
+            compute->descriptor_set_layout, NULL);
+    if (compute->shader_module)
+        context->api->DestroyShaderModule(context->device,
+            compute->shader_module, NULL);
+    memset(compute, 0, sizeof(*compute));
+}
+
+static ColiVulkanResult create_mapped_scratch_locked(
+    ColiVulkanContext *context,
+    VkDeviceSize size,
+    VkBuffer *buffer,
+    VkDeviceMemory *memory,
+    void **mapping,
+    VkDeviceSize *allocation_size,
+    uint32_t *memory_type_index,
+    uint32_t *heap_index,
+    VkMemoryPropertyFlags *property_flags
+) {
+    VkBufferCreateInfo buffer_info = {0};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult vk_result = context->api->CreateBuffer(context->device,
+        &buffer_info, NULL, buffer);
+    if (vk_result != VK_SUCCESS) {
+        if (vk_result == VK_ERROR_DEVICE_LOST) context_mark_device_lost(context);
+        return result_from_vk(vk_result);
+    }
+
+    VkMemoryRequirements requirements = {0};
+    context->api->GetBufferMemoryRequirements(context->device, *buffer,
+        &requirements);
+    *memory_type_index = find_system_host_memory_type(
+        &context->memory_properties, requirements.memoryTypeBits, heap_index,
+        property_flags);
+    if (requirements.size < size || !requirements.memoryTypeBits ||
+        *memory_type_index == UINT32_MAX) {
+        context->api->DestroyBuffer(context->device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        return *memory_type_index == UINT32_MAX ? COLI_VULKAN_UNSUPPORTED
+            : COLI_VULKAN_ERROR;
+    }
+    if (context->live_allocations >= context->max_memory_allocation_count) {
+        context->api->DestroyBuffer(context->device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        return COLI_VULKAN_LIMIT_EXCEEDED;
+    }
+
+    VkMemoryAllocateInfo allocation_info = {0};
+    allocation_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation_info.allocationSize = requirements.size;
+    allocation_info.memoryTypeIndex = *memory_type_index;
+    vk_result = context->api->AllocateMemory(context->device, &allocation_info,
+        NULL, memory);
+    if (vk_result != VK_SUCCESS) {
+        if (vk_result == VK_ERROR_DEVICE_LOST) context_mark_device_lost(context);
+        context->api->DestroyBuffer(context->device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        return result_from_vk(vk_result);
+    }
+    context->live_allocations++;
+    *allocation_size = requirements.size;
+    vk_result = context->api->BindBufferMemory(context->device, *buffer,
+        *memory, 0);
+    if (vk_result == VK_SUCCESS)
+        vk_result = context->api->MapMemory(context->device, *memory, 0, size,
+            0, mapping);
+    if (vk_result != VK_SUCCESS || !*mapping) {
+        if (vk_result == VK_ERROR_DEVICE_LOST) context_mark_device_lost(context);
+        context->api->DestroyBuffer(context->device, *buffer, NULL);
+        context->api->FreeMemory(context->device, *memory, NULL);
+        context->live_allocations--;
+        *buffer = VK_NULL_HANDLE;
+        *memory = VK_NULL_HANDLE;
+        *mapping = NULL;
+        return vk_result == VK_SUCCESS ? COLI_VULKAN_ERROR
+            : result_from_vk(vk_result);
+    }
+    return COLI_VULKAN_OK;
+}
+
+static int compute_host_is_little_endian(const ColiVulkanContext *context) {
+#ifdef COLI_VULKAN_TESTING
+    if (context->test_force_big_endian) return 0;
+#else
+    (void)context;
+#endif
+    const uint32_t marker = 1;
+    unsigned char first = 0;
+    memcpy(&first, &marker, sizeof(first));
+    return first == 1;
+}
+
+ColiVulkanResult coli_vulkan_compute_prepare(
+    ColiVulkanContext *context,
+    const ColiVulkanComputeConfig *config
+) {
+    if (!context || !config || config->max_rows != 64 ||
+        !config->input_width || config->input_width % 8 ||
+        !config->output_width)
+        return COLI_VULKAN_INVALID_ARGUMENT;
+    uint64_t input_values = (uint64_t)config->max_rows * config->input_width;
+    uint64_t output_values = (uint64_t)config->max_rows * config->output_width;
+    if (input_values > UINT32_MAX || output_values > UINT32_MAX ||
+        input_values > UINT64_MAX / sizeof(float) ||
+        output_values > UINT64_MAX / sizeof(float))
+        return COLI_VULKAN_LIMIT_EXCEEDED;
+    VkDeviceSize input_bytes = (VkDeviceSize)(input_values * sizeof(float));
+    VkDeviceSize output_bytes = (VkDeviceSize)(output_values * sizeof(float));
+
+    pthread_mutex_lock(&context->mutex);
+    ColiVulkanResult result = COLI_VULKAN_OK;
+    ComputeState *compute = &context->compute;
+    if (context->device_lost) {
+        result = COLI_VULKAN_DEVICE_LOST;
+        goto out;
+    }
+    if (context->shutting_down || !context->usable) {
+        result = COLI_VULKAN_BUSY;
+        goto out;
+    }
+    if (context->pending.kind != PENDING_NONE) {
+        result = COLI_VULKAN_BUSY;
+        goto out;
+    }
+    if (compute->prepared) {
+        result = compute->max_rows == config->max_rows &&
+            compute->input_width == config->input_width &&
+            compute->output_width == config->output_width
+            ? COLI_VULKAN_OK : COLI_VULKAN_INVALID_ARGUMENT;
+        goto out;
+    }
+    if (!compute_host_is_little_endian(context)) {
+        result = COLI_VULKAN_UNSUPPORTED;
+        goto out;
+    }
+    if (!compute_api_complete(context->api)) {
+        result = COLI_VULKAN_UNSUPPORTED;
+        goto out;
+    }
+    const VkPhysicalDeviceLimits *limits = &context->properties.limits;
+    uint64_t groups = (output_values + 63) / 64;
+    if (limits->maxComputeWorkGroupInvocations < 64 ||
+        limits->maxComputeWorkGroupSize[0] < 64 ||
+        groups > limits->maxComputeWorkGroupCount[0] ||
+        limits->maxPushConstantsSize < 6 * sizeof(uint32_t) ||
+        limits->maxPerStageDescriptorStorageBuffers < 3 ||
+        limits->maxDescriptorSetStorageBuffers < 3 ||
+        input_bytes > limits->maxStorageBufferRange ||
+        output_bytes > limits->maxStorageBufferRange ||
+        context->max_memory_allocation_count < 2 ||
+        context->live_allocations > context->max_memory_allocation_count - 2) {
+        result = COLI_VULKAN_LIMIT_EXCEEDED;
+        goto out;
+    }
+
+    VkShaderModuleCreateInfo shader_info = {0};
+    shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shader_info.codeSize = coli_vulkan_qt_fmt2_down_spv_size;
+    shader_info.pCode = coli_vulkan_qt_fmt2_down_spv;
+    VkResult vk_result = context->api->CreateShaderModule(context->device,
+        &shader_info, NULL, &compute->shader_module);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[3];
+    memset(bindings, 0, sizeof(bindings));
+    for (uint32_t i = 0; i < 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo descriptor_layout_info = {0};
+    descriptor_layout_info.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    descriptor_layout_info.bindingCount = 3;
+    descriptor_layout_info.pBindings = bindings;
+    vk_result = context->api->CreateDescriptorSetLayout(context->device,
+        &descriptor_layout_info, NULL, &compute->descriptor_set_layout);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+
+    VkPushConstantRange push_range = {0};
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.size = 6 * sizeof(uint32_t);
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {0};
+    pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &compute->descriptor_set_layout;
+    pipeline_layout_info.pushConstantRangeCount = 1;
+    pipeline_layout_info.pPushConstantRanges = &push_range;
+    vk_result = context->api->CreatePipelineLayout(context->device,
+        &pipeline_layout_info, NULL, &compute->pipeline_layout);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+
+    VkPipelineShaderStageCreateInfo stage = {0};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = compute->shader_module;
+    stage.pName = "main";
+    VkComputePipelineCreateInfo pipeline_info = {0};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage = stage;
+    pipeline_info.layout = compute->pipeline_layout;
+    vk_result = context->api->CreateComputePipelines(context->device,
+        VK_NULL_HANDLE, 1, &pipeline_info, NULL, &compute->pipeline);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+
+    VkDescriptorPoolSize pool_size = {0};
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = 3;
+    VkDescriptorPoolCreateInfo pool_info = {0};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    vk_result = context->api->CreateDescriptorPool(context->device, &pool_info,
+        NULL, &compute->descriptor_pool);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+    VkDescriptorSetAllocateInfo set_info = {0};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = compute->descriptor_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &compute->descriptor_set_layout;
+    vk_result = context->api->AllocateDescriptorSets(context->device, &set_info,
+        &compute->descriptor_set);
+    if (vk_result != VK_SUCCESS) {
+        result = result_from_vk(vk_result);
+        goto failed;
+    }
+
+    result = create_mapped_scratch_locked(context, input_bytes,
+        &compute->input_buffer, &compute->input_memory, &compute->input_mapping,
+        &compute->input_allocation_size, &compute->input_memory_type_index,
+        &compute->input_heap_index, &compute->input_memory_property_flags);
+    if (result != COLI_VULKAN_OK) goto failed;
+    result = create_mapped_scratch_locked(context, output_bytes,
+        &compute->output_buffer, &compute->output_memory,
+        &compute->output_mapping, &compute->output_allocation_size,
+        &compute->output_memory_type_index, &compute->output_heap_index,
+        &compute->output_memory_property_flags);
+    if (result != COLI_VULKAN_OK) goto failed;
+    compute->max_rows = config->max_rows;
+    compute->input_width = config->input_width;
+    compute->output_width = config->output_width;
+    compute->prepared = 1;
+    goto out;
+
+failed:
+    if (result == COLI_VULKAN_DEVICE_LOST) context_mark_device_lost(context);
+    compute_cleanup_locked(context);
+out:
+    pthread_mutex_unlock(&context->mutex);
+    return result;
+}
+
+typedef struct {
+    uint32_t input_width;
+    uint32_t output_width;
+    uint32_t rows;
+    uint32_t row_words;
+    uint32_t scale_word_offset;
+    uint32_t total_outputs;
+} ComputePushConstants;
+
+ColiVulkanResult coli_vulkan_tensor_matmul_fmt2(
+    ColiVulkanContext *context,
+    ColiVulkanTensor *tensor,
+    const float *input,
+    uint32_t rows,
+    float *output,
+    uint64_t timeout_ns
+) {
+    if (!context || !tensor || !input || !output || !rows)
+        return COLI_VULKAN_INVALID_ARGUMENT;
+    pthread_mutex_lock(&context->mutex);
+    ColiVulkanResult result = COLI_VULKAN_OK;
+    VulkanUploadOp op = {0};
+    ComputeState *compute = &context->compute;
+    if (!tensor_is_live_locked(context, tensor) || tensor->context != context) {
+        result = COLI_VULKAN_INVALID_ARGUMENT;
+        goto out;
+    }
+    if (!context->usable || context->device_lost || context->shutting_down) {
+        result = context->device_lost ? COLI_VULKAN_DEVICE_LOST
+            : COLI_VULKAN_BUSY;
+        goto out;
+    }
+    if (!compute->prepared || context->pending.kind != PENDING_NONE) {
+        result = context->pending.kind != PENDING_NONE ? COLI_VULKAN_BUSY
+            : COLI_VULKAN_UNSUPPORTED;
+        goto out;
+    }
+    if (!tensor->compute_eligible ||
+        tensor->state != COLI_VULKAN_TENSOR_READY ||
+        tensor->I != compute->input_width ||
+        tensor->O != compute->output_width || rows > compute->max_rows ||
+        tensor->layout.packed_size > context->properties.limits.maxStorageBufferRange) {
+        result = COLI_VULKAN_UNSUPPORTED;
+        goto out;
+    }
+
+    uint64_t input_values = (uint64_t)rows * compute->input_width;
+    uint64_t output_values = (uint64_t)rows * compute->output_width;
+    if (input_values > SIZE_MAX / sizeof(float) ||
+        output_values > SIZE_MAX / sizeof(float) ||
+        output_values > UINT32_MAX || tensor->layout.scale_offset % 4) {
+        result = COLI_VULKAN_LIMIT_EXCEEDED;
+        goto out;
+    }
+    VkDeviceSize input_bytes = (VkDeviceSize)(input_values * sizeof(float));
+    VkDeviceSize output_bytes = (VkDeviceSize)(output_values * sizeof(float));
+    memcpy(compute->input_mapping, input, (size_t)input_bytes);
+
+    VkDescriptorBufferInfo buffer_info[3];
+    memset(buffer_info, 0, sizeof(buffer_info));
+    buffer_info[0].buffer = tensor->buffer;
+    buffer_info[0].range = tensor->layout.packed_size;
+    buffer_info[1].buffer = compute->input_buffer;
+    buffer_info[1].range = input_bytes;
+    buffer_info[2].buffer = compute->output_buffer;
+    buffer_info[2].range = output_bytes;
+    VkWriteDescriptorSet writes[3];
+    memset(writes, 0, sizeof(writes));
+    for (uint32_t i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = compute->descriptor_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_info[i];
+    }
+    context->api->UpdateDescriptorSets(context->device, 3, writes, 0, NULL);
+
+    op.device = context->device;
+    op.commandPool = context->command_pool;
+    op.api = context->api;
+    VkCommandBufferAllocateInfo command_info = {0};
+    command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_info.commandPool = context->command_pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    VkResult vk_result = context->api->AllocateCommandBuffers(context->device,
+        &command_info, &op.commandBuffer);
+    if (vk_result == VK_SUCCESS) {
+        VkCommandBufferBeginInfo begin_info = {0};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vk_result = context->api->BeginCommandBuffer(op.commandBuffer,
+            &begin_info);
+    }
+    if (vk_result == VK_SUCCESS) {
+        VkBufferMemoryBarrier input_barrier = {0};
+        input_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        input_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        input_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        input_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        input_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        input_barrier.buffer = compute->input_buffer;
+        input_barrier.size = input_bytes;
+        context->api->CmdPipelineBarrier(op.commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+            0, NULL, 1, &input_barrier, 0, NULL);
+        context->api->CmdBindPipeline(op.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE, compute->pipeline);
+        context->api->CmdBindDescriptorSets(op.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE, compute->pipeline_layout, 0, 1,
+            &compute->descriptor_set, 0, NULL);
+        ComputePushConstants push = {
+            compute->input_width, compute->output_width, rows,
+            compute->input_width / 8,
+            (uint32_t)(tensor->layout.scale_offset / 4),
+            (uint32_t)output_values
+        };
+        context->api->CmdPushConstants(op.commandBuffer,
+            compute->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            sizeof(push), &push);
+        context->api->CmdDispatch(op.commandBuffer,
+            (uint32_t)((output_values + 63) / 64), 1, 1);
+        context->compute_dispatch_recorded++;
+        VkBufferMemoryBarrier output_barrier = {0};
+        output_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        output_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        output_barrier.buffer = compute->output_buffer;
+        output_barrier.size = output_bytes;
+        context->api->CmdPipelineBarrier(op.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+            0, NULL, 1, &output_barrier, 0, NULL);
+        vk_result = context->api->EndCommandBuffer(op.commandBuffer);
+    }
+    if (vk_result == VK_SUCCESS) {
+        VkFenceCreateInfo fence_info = {0};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vk_result = context->api->CreateFence(context->device, &fence_info,
+            NULL, &op.fence);
+    }
+    if (vk_result != VK_SUCCESS) {
+        if (vk_result == VK_ERROR_DEVICE_LOST) {
+            context_mark_device_lost(context);
+            context->compute_device_lost++;
+        } else {
+            context->compute_errors++;
+        }
+        operation_cleanup(context->api, &op);
+        result = result_from_vk(vk_result);
+        goto out;
+    }
+
+    VkSubmitInfo submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &op.commandBuffer;
+    vk_result = context->api->QueueSubmit(context->queue, 1, &submit_info,
+        op.fence);
+    if (vk_result != VK_SUCCESS) {
+        if (vk_result == VK_ERROR_DEVICE_LOST) {
+            op.lastResult = vk_result;
+            register_pending_locked(context, PENDING_COMPUTE, tensor, &op);
+            context->pending.compute_rows = rows;
+            context->compute_device_lost++;
+            context_mark_device_lost(context);
+            result = COLI_VULKAN_DEVICE_LOST;
+        } else {
+            operation_cleanup(context->api, &op);
+            context->compute_errors++;
+            result = result_from_vk(vk_result);
+        }
+        goto out;
+    }
+    context->compute_submitted++;
+    uint64_t wait_ns = timeout_ns ? timeout_ns : context->upload_timeout_ns;
+    vk_result = context->api->WaitForFences(context->device, 1, &op.fence,
+        VK_TRUE, wait_ns);
+    if (vk_result != VK_SUCCESS) {
+        op.lastResult = vk_result;
+        register_pending_locked(context, PENDING_COMPUTE, tensor, &op);
+        context->pending.compute_rows = rows;
+        if (vk_result == VK_TIMEOUT) {
+            context->compute_timeouts++;
+            result = COLI_VULKAN_TIMEOUT;
+        } else if (vk_result == VK_ERROR_DEVICE_LOST) {
+            context->compute_device_lost++;
+            context_mark_device_lost(context);
+            result = COLI_VULKAN_DEVICE_LOST;
+        } else {
+            context->compute_errors++;
+            context->degraded = 1;
+            context->usable = 0;
+            result = COLI_VULKAN_ERROR;
+        }
+        goto out;
+    }
+    memcpy(output, compute->output_mapping, (size_t)output_bytes);
+    operation_cleanup(context->api, &op);
+    context->compute_completed++;
+    context->compute_rows_completed += rows;
+out:
+    pthread_mutex_unlock(&context->mutex);
+    return result;
 }
 
 ColiVulkanResult coli_vulkan_tensor_readback(
@@ -1417,7 +2054,7 @@ ColiVulkanResult coli_vulkan_tensor_get_info(
     info->source_weight_bytes = tensor->source_weight_bytes;
     info->source_scale_bytes = tensor->source_scale_bytes;
     info->uploaded_scale_bytes = tensor->uploaded_scale_bytes;
-    info->compute_eligible = 0;
+    info->compute_eligible = tensor->compute_eligible;
     info->allocation_size = tensor->allocation_size;
     info->memory_type_index = tensor->memory_type_index;
     info->heap_index = tensor->heap_index;
@@ -1493,6 +2130,25 @@ ColiVulkanResult coli_vulkan_context_get_info(
     info->live_tensors = context->live_tensors;
     info->live_allocations = context->live_allocations;
     info->pending_operations = context->pending.kind != PENDING_NONE;
+    info->compute_max_rows = context->compute.max_rows;
+    info->compute_input_memory_type_index =
+        context->compute.input_memory_type_index;
+    info->compute_input_heap_index = context->compute.input_heap_index;
+    info->compute_output_memory_type_index =
+        context->compute.output_memory_type_index;
+    info->compute_output_heap_index = context->compute.output_heap_index;
+    info->compute_input_memory_property_flags =
+        context->compute.input_memory_property_flags;
+    info->compute_output_memory_property_flags =
+        context->compute.output_memory_property_flags;
+    info->compute_dispatch_recorded = context->compute_dispatch_recorded;
+    info->compute_submitted = context->compute_submitted;
+    info->compute_completed = context->compute_completed;
+    info->compute_rows_completed = context->compute_rows_completed;
+    info->compute_timeouts = context->compute_timeouts;
+    info->compute_errors = context->compute_errors;
+    info->compute_device_lost = context->compute_device_lost;
+    info->compute_prepared = context->compute.prepared;
     info->usable = context->usable;
     info->device_lost = context->device_lost;
     pthread_mutex_unlock(&context->mutex);
@@ -1536,6 +2192,7 @@ ColiVulkanResult coli_vulkan_context_destroy(
         return COLI_VULKAN_DEVICE_LOST;
     }
     while (context->tensors) tensor_destroy_locked(context, context->tensors);
+    compute_cleanup_locked(context);
     if (context->live_allocations != 0) {
         pthread_mutex_unlock(&context->mutex);
         return COLI_VULKAN_ERROR;

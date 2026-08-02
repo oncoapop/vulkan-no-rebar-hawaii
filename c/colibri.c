@@ -72,6 +72,7 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#include "vulkan_phase4a_gate.h"
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -120,7 +121,7 @@ typedef struct {
     ColiCudaTensor *cuda;
 #endif
 #ifdef COLI_VULKAN
-    ColiVulkanTensor *vulkan;                    /* upload-only residency; never compute eligibility */
+    ColiVulkanTensor *vulkan;                    /* opaque resident tensor; Phase 4A may use pinned fmt2 down */
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
@@ -209,7 +210,12 @@ typedef struct {
     ColiVulkanContext *vulkan_context;
     uint64_t vulkan_timeout_ns;
     uint32_t vulkan_expert_count, vulkan_tensor_count;
-    int vulkan_requested, vulkan_startup_failed;
+    int vulkan_requested, vulkan_compute_requested, vulkan_validate;
+    int vulkan_startup_failed;
+    uint64_t vulkan_down_calls, vulkan_down_rows;
+    uint64_t vulkan_cpu_gate_up_rows, vulkan_cpu_reference_down_rows;
+    uint64_t vulkan_cpu_down_fallbacks, vulkan_validation_failures;
+    double vulkan_max_abs, vulkan_max_rel;
 #endif
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
@@ -298,8 +304,12 @@ static int g_repin;
 static uint64_t g_last_repin;
 #ifdef COLI_VULKAN
 static int g_vulkan_requested;
+static int g_vulkan_compute_requested, g_vulkan_validate;
 static ColiVulkanContext *g_vulkan_exit_context;
 static uint64_t g_vulkan_exit_timeout_ns;
+static void vulkan_expert_down_or_die(Model *m, int layer, int eid,
+                                     ESlot *expert, float *output,
+                                     const float *input, int rows);
 #endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -3554,7 +3564,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
-            matmul_qt(hh, gg, &e->d, nr);
+#ifdef COLI_VULKAN
+            if(m->vulkan_compute_requested){
+                m->vulkan_cpu_gate_up_rows+=(uint64_t)nr;
+                vulkan_expert_down_or_die(m,layer,eid,e,hh,gg,nr);
+            } else
+#endif
+                matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
@@ -6474,7 +6490,6 @@ static int vulkan_tensor_matches(
            info->source_weight_bytes==qt->weight_bytes &&
            info->source_scale_bytes==qt->scale_bytes &&
            info->uploaded_scale_bytes==layout->uploaded_scale_bytes &&
-           !info->compute_eligible &&
            (info->memory_property_flags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
            !(info->memory_property_flags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 }
@@ -6542,6 +6557,58 @@ static void pin_vulkan_upload_prefix(
     }
 }
 
+static void vulkan_expert_down_or_die(
+    Model *m, int layer, int eid, ESlot *expert, float *output,
+    const float *input, int rows
+){
+    if(!m||!expert||!expert->d.vulkan){
+        if(m) m->vulkan_cpu_down_fallbacks++;
+        fprintf(stderr,"[VULKAN] COMPUTE fatal: layer=%d expert=%d rows=%d "
+                "result=MISSING_RESIDENT_DOWN cpu_fallback=forbidden\n",
+                layer,eid,rows);
+        exit(2);
+    }
+    ColiVulkanResult result=coli_vulkan_tensor_matmul_fmt2(m->vulkan_context,
+        expert->d.vulkan,input,(uint32_t)rows,output,m->vulkan_timeout_ns);
+    if(result!=COLI_VULKAN_OK){
+        fprintf(stderr,"[VULKAN] COMPUTE fatal: layer=%d expert=%d rows=%d result=%s\n",
+                layer,eid,rows,coli_vulkan_result_string(result));
+        exit(2);       /* backend returned with its context mutex released */
+    }
+    m->vulkan_down_calls++;
+    m->vulkan_down_rows+=(uint64_t)rows;
+    if(m->vulkan_validate){
+        size_t count=(size_t)rows*(size_t)m->c.hidden;
+        float *reference=malloc(count*sizeof(float));
+        if(!reference){
+            fprintf(stderr,"[VULKAN] COMPUTE fatal: layer=%d expert=%d rows=%d "
+                    "result=CPU_REFERENCE_OOM\n",layer,eid,rows);
+            exit(2);
+        }
+        matmul_qt_ex(reference,input,&expert->d,rows,0);
+        m->vulkan_cpu_reference_down_rows+=(uint64_t)rows;
+        int failed=0;
+        for(size_t i=0;i<count;i++){
+            float actual=output[i], expected=reference[i];
+            double absolute=fabs((double)actual-(double)expected);
+            double magnitude=fmax(fabs((double)actual),fabs((double)expected));
+            double relative=absolute/fmax(1e-6,magnitude);
+            if(absolute>m->vulkan_max_abs) m->vulkan_max_abs=absolute;
+            if(relative>m->vulkan_max_rel) m->vulkan_max_rel=relative;
+            if(!isfinite(actual)||!isfinite(expected)||
+               absolute>5e-5+5e-4*magnitude) failed=1;
+        }
+        free(reference);
+        if(failed){
+            m->vulkan_validation_failures++;
+            fprintf(stderr,"[VULKAN] COMPUTE fatal: layer=%d expert=%d rows=%d "
+                    "result=NUMERICAL_MISMATCH max_abs=%.9g max_rel=%.9g\n",
+                    layer,eid,rows,m->vulkan_max_abs,m->vulkan_max_rel);
+            exit(2);
+        }
+    }
+}
+
 static int vulkan_finalize_startup(Model *m){
     if(!m->vulkan_requested) return 1;
     if(m->vulkan_startup_failed || m->vulkan_expert_count==0){
@@ -6574,6 +6641,64 @@ static int vulkan_finalize_startup(Model *m){
     }
     if(seen!=m->vulkan_tensor_count){
         fprintf(stderr,"[VULKAN] published tensor count mismatch\n"); return 0;
+    }
+    if(m->vulkan_compute_requested){
+        uint32_t expected=0;
+        if(!info.compute_prepared || info.compute_max_rows!=64){
+            fprintf(stderr,"[VULKAN] compute pipeline/scratch was not prepared\n");
+            return 0;
+        }
+        for(int l=0;l<m->c.n_layers;l++) if(m->L[l].sparse){
+            expected+=(uint32_t)m->c.n_experts;
+            if(m->npin[l]!=m->c.n_experts){
+                fprintf(stderr,"[VULKAN] compute requires every startup expert: "
+                        "layer=%d pinned=%d expected=%d\n",
+                        l,m->npin[l],m->c.n_experts);
+                return 0;
+            }
+            unsigned char *ids=calloc((size_t)m->c.n_experts,1);
+            if(!ids){ fprintf(stderr,"[VULKAN] compute residency validation OOM\n"); return 0; }
+            for(int z=0;z<m->npin[l];z++){
+                ESlot *slot=&m->pin[l][z];
+                if(slot->eid<0||slot->eid>=m->c.n_experts||ids[slot->eid]||
+                   !slot->g.vulkan||!slot->u.vulkan||!slot->d.vulkan){
+                    free(ids);
+                    fprintf(stderr,"[VULKAN] compute startup tier has a missing/duplicate expert\n");
+                    return 0;
+                }
+                ids[slot->eid]=1;
+                ColiVulkanTensorInfo down;
+                if(coli_vulkan_tensor_get_info(slot->d.vulkan,&down)!=COLI_VULKAN_OK ||
+                   !down.compute_eligible||down.state!=COLI_VULKAN_TENSOR_READY||
+                   down.fmt!=2||down.gs!=0||down.I!=(uint64_t)m->c.moe_inter||
+                   down.O!=(uint64_t)m->c.hidden){
+                    free(ids);
+                    fprintf(stderr,"[VULKAN] compute down tensor format/geometry is unsupported "
+                            "at layer=%d expert=%d\n",l,slot->eid);
+                    return 0;
+                }
+            }
+            for(int e=0;e<m->c.n_experts;e++) if(!ids[e]){
+                free(ids);
+                fprintf(stderr,"[VULKAN] compute startup tier omitted layer=%d expert=%d\n",l,e);
+                return 0;
+            }
+            free(ids);
+        }
+        if(expected==0||m->vulkan_expert_count!=expected||
+           m->vulkan_tensor_count!=3*expected){
+            fprintf(stderr,"[VULKAN] compute requires a complete main sparse tier: "
+                    "experts=%u expected=%u tensors=%u\n",
+                    m->vulkan_expert_count,expected,m->vulkan_tensor_count);
+            return 0;
+        }
+        fprintf(stderr,"[VULKAN] READY compute-down-fmt2: vendor=0x%04x device=0x%04x "
+                "experts=%u tensors=%u committed=%llu budget=%llu pending=0 max_rows=64 "
+                "gate_up=CPU down=Vulkan host_copies=retained\n",
+                info.vendor_id,info.device_id,m->vulkan_expert_count,m->vulkan_tensor_count,
+                (unsigned long long)info.committed_bytes,
+                (unsigned long long)info.effective_budget_bytes);
+        return 1;
     }
     fprintf(stderr,"[VULKAN] READY upload-only: vendor=0x%04x device=0x%04x "
             "experts=%u tensors=%u committed=%llu budget=%llu pending=0 "
@@ -6612,6 +6737,30 @@ static ColiVulkanResult model_vulkan_release(Model *m){
         m->vulkan_expert_count=0; m->vulkan_tensor_count=0;
     }
     return result;
+}
+
+static void vulkan_compute_summary(Model *m){
+    if(!m||!m->vulkan_compute_requested||!m->vulkan_context) return;
+    ColiVulkanContextInfo info;
+    if(coli_vulkan_context_get_info(m->vulkan_context,&info)!=COLI_VULKAN_OK){
+        fprintf(stderr,"[VULKAN] COMPUTE summary unavailable: context info failed\n");
+        return;
+    }
+    fprintf(stderr,"[VULKAN] COMPUTE summary: kernel=fmt2-down dispatches=%llu "
+            "submitted=%llu completed=%llu rows=%llu cpu_gate_up_rows=%llu "
+            "cpu_reference_down_rows=%llu cpu_down_fallbacks=%llu timeouts=%llu "
+            "errors=%llu device_lost=%llu pending=%u max_abs=%.9g max_rel=%.9g\n",
+            (unsigned long long)info.compute_dispatch_recorded,
+            (unsigned long long)info.compute_submitted,
+            (unsigned long long)info.compute_completed,
+            (unsigned long long)info.compute_rows_completed,
+            (unsigned long long)m->vulkan_cpu_gate_up_rows,
+            (unsigned long long)m->vulkan_cpu_reference_down_rows,
+            (unsigned long long)m->vulkan_cpu_down_fallbacks,
+            (unsigned long long)info.compute_timeouts,
+            (unsigned long long)(info.compute_errors+m->vulkan_validation_failures),
+            (unsigned long long)info.compute_device_lost,info.pending_operations,
+            m->vulkan_max_abs,m->vulkan_max_rel);
 }
 
 static void vulkan_exit_cleanup(void){
@@ -7031,7 +7180,9 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
 #endif
 #ifdef COLI_VULKAN
     if(m->vulkan_requested&&m->vulkan_expert_count)
-        backend="CPU + Vulkan residency (upload-only)";
+        backend=m->vulkan_compute_requested?
+            "CPU gate/up + Vulkan routed down (fmt2)":
+            "CPU + Vulkan residency (upload-only)";
 #endif
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
@@ -7127,6 +7278,29 @@ int main(int argc, char **argv){
 #else
       if(request&&!strcmp(request,"1")){
           fprintf(stderr,"Vulkan was requested, but this binary is CPU-only; rebuild with: make VULKAN=1\n");
+          return 2;
+      }
+#endif
+    }
+    { const char *compute=getenv("COLI_VULKAN_COMPUTE");
+      const char *validate=getenv("COLI_VULKAN_VALIDATE");
+      if((compute&&strcmp(compute,"0")&&strcmp(compute,"1"))||
+         (validate&&strcmp(validate,"0")&&strcmp(validate,"1"))){
+          fprintf(stderr,"COLI_VULKAN_COMPUTE and COLI_VULKAN_VALIDATE must be exactly 0 or 1\n");
+          return 2;
+      }
+#ifdef COLI_VULKAN
+      g_vulkan_compute_requested=compute&&!strcmp(compute,"1");
+      g_vulkan_validate=validate&&!strcmp(validate,"1");
+      if(g_vulkan_compute_requested&&!g_vulkan_requested){
+          fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires COLI_VULKAN=1\n"); return 2;
+      }
+      if(g_vulkan_validate&&!g_vulkan_compute_requested){
+          fprintf(stderr,"COLI_VULKAN_VALIDATE=1 requires COLI_VULKAN_COMPUTE=1\n"); return 2;
+      }
+#else
+      if((compute&&!strcmp(compute,"1"))||(validate&&!strcmp(validate,"1"))){
+          fprintf(stderr,"Vulkan compute was requested, but this binary is CPU-only; rebuild with: make VULKAN=1\n");
           return 2;
       }
 #endif
@@ -7402,6 +7576,8 @@ int main(int argc, char **argv){
     int exit_status=0;
 #ifdef COLI_VULKAN
     m.vulkan_requested=g_vulkan_requested;
+    m.vulkan_compute_requested=g_vulkan_compute_requested;
+    m.vulkan_validate=g_vulkan_validate;
     if(g_vulkan_requested){
         m.vulkan_timeout_ns=vulkan_config.upload_timeout_ns;
         ColiVulkanResult result=coli_vulkan_context_create(&m.vulkan_context,&vulkan_config);
@@ -7470,6 +7646,37 @@ int main(int argc, char **argv){
     int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") &&
                                atoi(getenv("SERVE_BATCH")) && mux_slots>1;
     int eff_draft = mux_will_disable_mtp ? 0 : g_draft;
+#ifdef COLI_VULKAN
+    if(m.vulkan_compute_requested){
+        const char *mtp=getenv("MTP");
+        if(g_idot!=0){ fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires effective IDOT=0\n"); exit_status=2; goto model_cleanup; }
+        if(g_xexp!=0){ fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires effective XEXP=0\n"); exit_status=2; goto model_cleanup; }
+        if(g_repin!=0){ fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires effective REPIN=0\n"); exit_status=2; goto model_cleanup; }
+        ColiVulkanPhase4aGateResult mtp_gate=
+            coli_vulkan_phase4a_mtp_gate(m.has_mtp,mtp,eff_draft);
+        if(mtp_gate==COLI_VULKAN_PHASE4A_GATE_MTP_SETTING){
+            fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires MTP effectively disabled with MTP=0\n");
+            exit_status=2; goto model_cleanup;
+        }
+        if(mtp_gate==COLI_VULKAN_PHASE4A_GATE_DRAFT_ACTIVE){
+            fprintf(stderr,"COLI_VULKAN_COMPUTE=1 requires effective DRAFT=0\n");
+            exit_status=2; goto model_cleanup;
+        }
+        if(getenv("SERVE")||getenv("SCORE")){
+            fprintf(stderr,"COLI_VULKAN_COMPUTE=1 Phase 4A supports generation only\n");
+            exit_status=2; goto model_cleanup;
+        }
+        ColiVulkanComputeConfig compute_config={64,(uint32_t)m.c.moe_inter,
+                                                   (uint32_t)m.c.hidden};
+        ColiVulkanResult compute_result=coli_vulkan_compute_prepare(
+            m.vulkan_context,&compute_config);
+        if(compute_result!=COLI_VULKAN_OK){
+            fprintf(stderr,"[VULKAN] compute pipeline preparation failed: %s\n",
+                    coli_vulkan_result_string(compute_result));
+            exit_status=2; goto model_cleanup;
+        }
+    }
+#endif
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
            m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft);
@@ -7654,6 +7861,7 @@ int main(int argc, char **argv){
     if(stats) stats_dump(&m,stats);
 model_cleanup:
 #ifdef COLI_VULKAN
+    vulkan_compute_summary(&m);
     if(m.vulkan_context){
         ColiVulkanResult cleanup_result=model_vulkan_release(&m);
         if(cleanup_result!=COLI_VULKAN_OK){
