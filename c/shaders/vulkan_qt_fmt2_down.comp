@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer PackedTensor {
+    uint words[];
+} tensor;
+
+layout(std430, binding = 1) readonly buffer Activations {
+    float values[];
+} activation;
+
+layout(std430, binding = 2) writeonly buffer Results {
+    float values[];
+} result;
+
+layout(push_constant) uniform PushConstants {
+    uint input_width;
+    uint output_width;
+    uint rows;
+    uint row_words;
+    uint scale_word_offset;
+    uint total_outputs;
+} pc;
+
+void main() {
+    uint output_index = gl_GlobalInvocationID.x;
+    if (output_index >= pc.total_outputs)
+        return;
+
+    uint row = output_index / pc.output_width;
+    uint output_column = output_index - row * pc.output_width;
+    uint weight_base = output_column * pc.row_words;
+    uint activation_base = row * pc.input_width;
+    float sum = 0.0;
+
+    for (uint word_index = 0; word_index < pc.row_words; ++word_index) {
+        uint packed = tensor.words[weight_base + word_index];
+        uint input_base = word_index * 8u;
+        for (uint nibble_index = 0; nibble_index < 8u; ++nibble_index) {
+            int weight = int((packed >> (nibble_index * 4u)) & 15u) - 8;
+            sum += activation.values[activation_base + input_base + nibble_index]
+                * float(weight);
+        }
+    }
+
+    float scale = uintBitsToFloat(
+        tensor.words[pc.scale_word_offset + output_column]);
+    result.values[output_index] = sum * scale;
+}

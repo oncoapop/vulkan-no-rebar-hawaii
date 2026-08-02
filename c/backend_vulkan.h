@@ -151,10 +151,27 @@ typedef struct {
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
     PFN_vkEndCommandBuffer EndCommandBuffer;
     PFN_vkCmdCopyBuffer CmdCopyBuffer;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdBindPipeline CmdBindPipeline;
+    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
+    PFN_vkCmdPushConstants CmdPushConstants;
+    PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCreateFence CreateFence;
     PFN_vkDestroyFence DestroyFence;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkWaitForFences WaitForFences;
+    PFN_vkCreateShaderModule CreateShaderModule;
+    PFN_vkDestroyShaderModule DestroyShaderModule;
+    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
+    PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout;
+    PFN_vkCreatePipelineLayout CreatePipelineLayout;
+    PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
+    PFN_vkCreateComputePipelines CreateComputePipelines;
+    PFN_vkDestroyPipeline DestroyPipeline;
+    PFN_vkCreateDescriptorPool CreateDescriptorPool;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
+    PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
 } ColiVulkanApi;
 #endif
 
@@ -165,8 +182,17 @@ typedef struct {
     uint64_t upload_timeout_ns;
 #ifdef COLI_VULKAN_TESTING
     const ColiVulkanApi *test_api;
+    /* Test-only deterministic coverage for the compute endian gate. */
+    int test_force_big_endian;
 #endif
 } ColiVulkanConfig;
+
+typedef struct {
+    /* Phase 4A fixes this at 64; other values are rejected. */
+    uint32_t max_rows;
+    uint32_t input_width;
+    uint32_t output_width;
+} ColiVulkanComputeConfig;
 
 typedef struct {
     uint32_t vendor_id;
@@ -182,6 +208,21 @@ typedef struct {
     uint32_t live_tensors;
     uint32_t live_allocations;
     uint32_t pending_operations;
+    uint32_t compute_max_rows;
+    uint32_t compute_input_memory_type_index;
+    uint32_t compute_input_heap_index;
+    uint32_t compute_output_memory_type_index;
+    uint32_t compute_output_heap_index;
+    VkMemoryPropertyFlags compute_input_memory_property_flags;
+    VkMemoryPropertyFlags compute_output_memory_property_flags;
+    uint64_t compute_dispatch_recorded;
+    uint64_t compute_submitted;
+    uint64_t compute_completed;
+    uint64_t compute_rows_completed;
+    uint64_t compute_timeouts;
+    uint64_t compute_errors;
+    uint64_t compute_device_lost;
+    int compute_prepared;
     int usable;
     int device_lost;
 } ColiVulkanContextInfo;
@@ -329,6 +370,37 @@ ColiVulkanResult coli_vulkan_tensor_get_info(
 );
 
 /*
+ * Creates the optional persistent format-2 compute pipeline and two mapped
+ * system-memory scratch buffers. Scratch is strictly HOST_VISIBLE and
+ * HOST_COHERENT while excluding DEVICE_LOCAL memory and the Hawaii BAR heap.
+ * The packed-word kernel requires a little-endian host; other hosts return
+ * COLI_VULKAN_UNSUPPORTED here without affecting upload-only residency.
+ * Repeating the identical request is harmless; a different request is rejected.
+ */
+ColiVulkanResult coli_vulkan_compute_prepare(
+    ColiVulkanContext *context,
+    const ColiVulkanComputeConfig *config
+);
+
+/*
+ * Synchronously calculates `rows` format-2 matrix rows with one READY,
+ * strict-local tensor. `output` is valid only on COLI_VULKAN_OK. The context
+ * serializes queue, command-pool, descriptor, mapped-scratch, and counter
+ * access across concurrent host callers. After a submitted TIMEOUT, ERROR, or
+ * DEVICE_LOST, the fence, command buffer, selected tensor, and every persistent
+ * dependency remain retained until bounded finish proves completion; after a
+ * timeout callers must finish and issue a new compute rather than use old data.
+ */
+ColiVulkanResult coli_vulkan_tensor_matmul_fmt2(
+    ColiVulkanContext *context,
+    ColiVulkanTensor *tensor,
+    const float *input,
+    uint32_t rows,
+    float *output,
+    uint64_t timeout_ns
+);
+
+/*
  * Frees immediately only when no submitted operation can still reference the
  * tensor. BUSY or DEVICE_LOST may be returned after clearing `*tensor`: the
  * caller's ownership is relinquished, but Vulkan destruction is deferred until
@@ -339,7 +411,12 @@ ColiVulkanResult coli_vulkan_tensor_free(
     ColiVulkanTensor **tensor
 );
 
-/* Finishes the single retained upload/readback operation with a bounded wait. */
+/*
+ * Finishes the single retained upload/readback/compute operation with a bounded
+ * wait. A successful finish of timed-out compute proves resource safety but
+ * does not make the old caller output valid; issue a new compute. DEVICE_LOST
+ * is terminal and never releases resources whose completion cannot be proven.
+ */
 ColiVulkanResult coli_vulkan_finish_pending(
     ColiVulkanContext *context,
     uint64_t timeout_ns

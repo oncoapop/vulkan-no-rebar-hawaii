@@ -231,8 +231,8 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
-# Vulkan remains completely opt-in. Phase 3B adds upload-only startup expert
-# residency; every inference and expert arithmetic path remains on the CPU.
+# Vulkan remains completely opt-in. Phase 3B upload-only residency remains
+# independent; Phase 4A optionally dispatches only startup-resident fmt2 down.
 VULKAN_OBJ    =
 PKG_CONFIG ?= pkg-config
 VULKAN_AVAILABLE = $(shell $(PKG_CONFIG) --exists vulkan 2>/dev/null && echo 1)
@@ -240,6 +240,8 @@ VULKAN_CFLAGS = $(shell $(PKG_CONFIG) --cflags vulkan 2>/dev/null)
 VULKAN_LDFLAGS = $(shell $(PKG_CONFIG) --libs vulkan 2>/dev/null || echo "-lvulkan")
 VULKAN_SANITIZER_FLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
 VULKAN_SANITIZER_WARN = -Wall -Wextra -Werror -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-unknown-pragmas
+GLSLANG_VALIDATOR ?= glslangValidator
+VULKAN_SHADER_COMPILER_ID = glslangValidator 11:15.1.0; target vulkan1.0
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -312,7 +314,7 @@ endif
 
 ifeq ($(VULKAN),1)
 ifeq (,$(LINUX))
-$(error VULKAN=1 Phase 3B is supported only on Linux)
+$(error VULKAN=1 is supported only on Linux)
 endif
 ifneq ($(CUDA),0)
 $(error choose VULKAN=1 or CUDA=1, not both)
@@ -360,7 +362,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c backend_vulkan.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) .build-config
+colibri$(EXE): colibri.c backend_vulkan.h vulkan_phase4a_gate.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
@@ -615,10 +617,10 @@ test-python: $(RANSLIB)
 tests/test_vulkan_staged_upload$(EXE): tests/test_vulkan_staged_upload.c
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) $< -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
 
-backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h shaders/vulkan_qt_fmt2_down_spv.h .build-config
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -c backend_vulkan.c -o $@
 
-backend_vulkan_test.o: backend_vulkan.c backend_vulkan.h
+backend_vulkan_test.o: backend_vulkan.c backend_vulkan.h shaders/vulkan_qt_fmt2_down_spv.h
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING -c backend_vulkan.c -o $@
 
 tests/test_vulkan_context$(EXE): tests/test_vulkan_context.c backend_vulkan_test.o
@@ -632,6 +634,12 @@ tests/test_vulkan_loader$(EXE): tests/test_vulkan_loader.c tests/test_vulkan_con
 
 tests/test_vulkan_loader_sanitize$(EXE): tests/test_vulkan_loader.c tests/test_vulkan_context.c colibri.c backend_vulkan.c backend_vulkan.h Makefile
 	$(CC) $(VULKAN_CFLAGS) -DCOLI_VULKAN -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_WARN) $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_loader.c backend_vulkan.c -o $@ -lm -pthread $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
+
+tests/test_vulkan_compute$(EXE): tests/test_vulkan_compute.c tests/test_vulkan_context.c vulkan_phase4a_gate.h backend_vulkan_test.o
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_vulkan_compute.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+tests/test_vulkan_compute_sanitize$(EXE): tests/test_vulkan_compute.c tests/test_vulkan_context.c backend_vulkan.c backend_vulkan.h vulkan_phase4a_gate.h Makefile
+	$(CC) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_WARN) $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_compute.c backend_vulkan.c -o $@ -lm -pthread $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
 
 tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c backend_vulkan_test.o
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_backend_vulkan.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
@@ -652,6 +660,10 @@ vulkan-loader-unit-test: vulkan-require-dev
 		./tests/test_vulkan_loader$(EXE) && \
 		./tests/test_vulkan_loader$(EXE) --device-lost
 
+vulkan-compute-unit-test: vulkan-require-dev vulkan-shader-verify
+	$(MAKE) tests/test_vulkan_compute$(EXE) && \
+		./tests/test_vulkan_compute$(EXE)
+
 vulkan-sanitize-test: vulkan-require-dev
 	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
 		env ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
@@ -664,6 +676,12 @@ vulkan-loader-sanitize-test: vulkan-require-dev
 		UBSAN_OPTIONS=halt_on_error=1 \
 		./tests/test_vulkan_loader_sanitize$(EXE)
 
+vulkan-compute-sanitize-test: vulkan-require-dev vulkan-shader-verify
+	$(MAKE) tests/test_vulkan_compute_sanitize$(EXE) && \
+		env ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_compute_sanitize$(EXE)
+
 vulkan-device-lost-sanitize-test: vulkan-require-dev
 	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
 		$(MAKE) tests/test_vulkan_loader_sanitize$(EXE) && \
@@ -673,6 +691,27 @@ vulkan-device-lost-sanitize-test: vulkan-require-dev
 		env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1 \
 		./tests/test_vulkan_loader_sanitize$(EXE) --device-lost
+
+vulkan-compute-device-lost-sanitize-test: vulkan-require-dev vulkan-shader-verify
+	$(MAKE) tests/test_vulkan_compute_sanitize$(EXE) && \
+		env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_compute_sanitize$(EXE) --device-lost
+
+vulkan-shader-verify:
+	@command -v "$(GLSLANG_VALIDATOR)" >/dev/null 2>&1 || { \
+		echo "FAIL: glslangValidator is required to verify checked-in SPIR-V" >&2; exit 1; }
+	@"$(GLSLANG_VALIDATOR)" --version | grep -qx 'Glslang Version: 11:15.1.0' || { \
+		echo "FAIL: shader verification requires glslangValidator 11:15.1.0" >&2; exit 1; }
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		"$(GLSLANG_VALIDATOR)" -V --target-env vulkan1.0 -S comp \
+		-o "$$tmp/vulkan_qt_fmt2_down.spv" shaders/vulkan_qt_fmt2_down.comp >/dev/null && \
+		$(PYTHON) tools/spv_to_header.py "$$tmp/vulkan_qt_fmt2_down.spv" \
+		"$$tmp/vulkan_qt_fmt2_down_spv.h" \
+		--source shaders/vulkan_qt_fmt2_down.comp \
+		--compiler '$(VULKAN_SHADER_COMPILER_ID)' && \
+		cmp -s "$$tmp/vulkan_qt_fmt2_down_spv.h" shaders/vulkan_qt_fmt2_down_spv.h || { \
+		echo "FAIL: checked-in Vulkan SPIR-V header is stale" >&2; exit 1; }
 
 vulkan-strict-flags-check:
 	@case " $(CFLAGS) " in *" -Werror "*) ;; \
@@ -684,7 +723,9 @@ vulkan-strict-compile-test: vulkan-require-dev
 	+$(MAKE) -B colibri VULKAN=0 EXTRA_WARNINGS=-Werror && \
 		$(MAKE) -B colibri vulkan-strict-flags-check \
 		VULKAN=1 EXTRA_WARNINGS=-Werror && \
-		! nm -g backend_vulkan.o | grep -q 'coli_vulkan_tensor_upload'
+		! nm -g backend_vulkan.o | grep -q 'coli_vulkan_tensor_upload' && \
+		! grep -q 'vkDeviceWaitIdle' backend_vulkan.c && \
+		$(MAKE) vulkan-shader-verify
 
 vulkan-hardware-test:
 	@if ! $(PKG_CONFIG) --exists vulkan; then \
@@ -703,14 +744,27 @@ vulkan-hardware-test-strict: vulkan-require-dev
 		env -u DISPLAY -u WAYLAND_DISPLAY VULKAN_EXPERT_MB=64 \
 		./tests/test_backend_vulkan$(EXE) --strict
 
+vulkan-compute-hardware-test-strict: vulkan-require-dev vulkan-shader-verify
+	$(MAKE) tests/test_backend_vulkan$(EXE) && \
+		env -u DISPLAY -u WAYLAND_DISPLAY VULKAN_EXPERT_MB=64 \
+		./tests/test_backend_vulkan$(EXE) --compute-strict
+
 vulkan-test:
 	+$(MAKE) vulkan-unit-test && \
 		$(MAKE) vulkan-loader-unit-test && \
-		$(MAKE) vulkan-hardware-test-strict
+		$(MAKE) vulkan-compute-unit-test && \
+		$(MAKE) vulkan-hardware-test-strict && \
+		$(MAKE) vulkan-compute-hardware-test-strict
 
 vulkan-loader-smoke: vulkan-require-dev
 	+$(MAKE) -B colibri VULKAN=1 && \
 		$(PYTHON) tests/test_vulkan_loader_smoke.py \
+		$(if $(strip $(VULKAN_SMOKE_MODEL)),--model "$(VULKAN_SMOKE_MODEL)",) \
+		--binary ./colibri --ref ref_glm.json
+
+vulkan-compute-smoke: vulkan-require-dev vulkan-shader-verify
+	+$(MAKE) -B colibri VULKAN=1 && \
+		$(PYTHON) tests/test_vulkan_compute_smoke.py \
 		$(if $(strip $(VULKAN_SMOKE_MODEL)),--model "$(VULKAN_SMOKE_MODEL)",) \
 		--binary ./colibri --ref ref_glm.json
 
@@ -773,4 +827,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-require-dev vulkan-strict-flags-check vulkan-strict-compile-test vulkan-unit-test vulkan-loader-unit-test vulkan-sanitize-test vulkan-loader-sanitize-test vulkan-device-lost-sanitize-test vulkan-hardware-test vulkan-hardware-test-strict vulkan-test vulkan-loader-smoke check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-require-dev vulkan-shader-verify vulkan-strict-flags-check vulkan-strict-compile-test vulkan-unit-test vulkan-loader-unit-test vulkan-compute-unit-test vulkan-sanitize-test vulkan-loader-sanitize-test vulkan-compute-sanitize-test vulkan-device-lost-sanitize-test vulkan-compute-device-lost-sanitize-test vulkan-hardware-test vulkan-hardware-test-strict vulkan-compute-hardware-test-strict vulkan-test vulkan-loader-smoke vulkan-compute-smoke check clean install uninstall bench
