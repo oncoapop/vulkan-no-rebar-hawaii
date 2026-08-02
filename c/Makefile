@@ -111,6 +111,12 @@ EXE     =
 endif
 endif
 
+# Optional additive warnings for validation builds. Keep this separate from
+# CFLAGS so recursive targets do not suppress backend-specific additions such
+# as -DCOLI_VULKAN by replacing CFLAGS on the make command line.
+EXTRA_WARNINGS ?=
+CFLAGS += $(EXTRA_WARNINGS)
+
 # --- install ---
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -225,14 +231,15 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
-# Vulkan remains completely opt-in. Phase 3A links only the persistent
-# context/tensor foundation; colibri.c does not dispatch Vulkan work yet.
+# Vulkan remains completely opt-in. Phase 3B adds upload-only startup expert
+# residency; every inference and expert arithmetic path remains on the CPU.
 VULKAN_OBJ    =
 PKG_CONFIG ?= pkg-config
 VULKAN_AVAILABLE = $(shell $(PKG_CONFIG) --exists vulkan 2>/dev/null && echo 1)
 VULKAN_CFLAGS = $(shell $(PKG_CONFIG) --cflags vulkan 2>/dev/null)
 VULKAN_LDFLAGS = $(shell $(PKG_CONFIG) --libs vulkan 2>/dev/null || echo "-lvulkan")
 VULKAN_SANITIZER_FLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+VULKAN_SANITIZER_WARN = -Wall -Wextra -Werror -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-unknown-pragmas
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -305,7 +312,7 @@ endif
 
 ifeq ($(VULKAN),1)
 ifeq (,$(LINUX))
-$(error VULKAN=1 Phase 3A is supported only on Linux)
+$(error VULKAN=1 Phase 3B is supported only on Linux)
 endif
 ifneq ($(CUDA),0)
 $(error choose VULKAN=1 or CUDA=1, not both)
@@ -353,7 +360,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) .build-config
+colibri$(EXE): colibri.c backend_vulkan.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
@@ -617,8 +624,14 @@ backend_vulkan_test.o: backend_vulkan.c backend_vulkan.h
 tests/test_vulkan_context$(EXE): tests/test_vulkan_context.c backend_vulkan_test.o
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_vulkan_context.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
 
-tests/test_vulkan_context_sanitize$(EXE): tests/test_vulkan_context.c backend_vulkan.c backend_vulkan.h
-	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_context.c backend_vulkan.c -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
+tests/test_vulkan_context_sanitize$(EXE): tests/test_vulkan_context.c backend_vulkan.c backend_vulkan.h Makefile
+	$(CC) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_WARN) $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_context.c backend_vulkan.c -o $@ -lm -pthread $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
+
+tests/test_vulkan_loader$(EXE): tests/test_vulkan_loader.c tests/test_vulkan_context.c colibri.c backend_vulkan_test.o backend_vulkan.h
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN -DCOLI_VULKAN_TESTING tests/test_vulkan_loader.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
+
+tests/test_vulkan_loader_sanitize$(EXE): tests/test_vulkan_loader.c tests/test_vulkan_context.c colibri.c backend_vulkan.c backend_vulkan.h Makefile
+	$(CC) $(VULKAN_CFLAGS) -DCOLI_VULKAN -DCOLI_VULKAN_TESTING $(VULKAN_SANITIZER_WARN) $(VULKAN_SANITIZER_FLAGS) tests/test_vulkan_loader.c backend_vulkan.c -o $@ -lm -pthread $(VULKAN_LDFLAGS) $(VULKAN_SANITIZER_FLAGS)
 
 tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c backend_vulkan_test.o
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -DCOLI_VULKAN_TESTING tests/test_backend_vulkan.c backend_vulkan_test.o -o $@ $(LDFLAGS) $(VULKAN_LDFLAGS)
@@ -634,17 +647,44 @@ vulkan-unit-test: vulkan-require-dev
 		./tests/test_vulkan_context$(EXE) && \
 		./tests/test_vulkan_context$(EXE) --device-lost
 
+vulkan-loader-unit-test: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_loader$(EXE) && \
+		./tests/test_vulkan_loader$(EXE) && \
+		./tests/test_vulkan_loader$(EXE) --device-lost
+
 vulkan-sanitize-test: vulkan-require-dev
 	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
 		env ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1 \
 		./tests/test_vulkan_context_sanitize$(EXE)
 
+vulkan-loader-sanitize-test: vulkan-require-dev
+	$(MAKE) tests/test_vulkan_loader_sanitize$(EXE) && \
+		env ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_loader_sanitize$(EXE)
+
 vulkan-device-lost-sanitize-test: vulkan-require-dev
 	$(MAKE) tests/test_vulkan_context_sanitize$(EXE) && \
+		$(MAKE) tests/test_vulkan_loader_sanitize$(EXE) && \
 		env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1 \
-		./tests/test_vulkan_context_sanitize$(EXE) --device-lost
+		./tests/test_vulkan_context_sanitize$(EXE) --device-lost && \
+		env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		./tests/test_vulkan_loader_sanitize$(EXE) --device-lost
+
+vulkan-strict-flags-check:
+	@case " $(CFLAGS) " in *" -Werror "*) ;; \
+		*) echo "FAIL: strict build is missing -Werror" >&2; exit 1;; esac
+	printf '%s\n' | $(CC) $(CFLAGS) -dM -E -x c - | \
+		grep -qx '#define COLI_VULKAN 1'
+
+vulkan-strict-compile-test: vulkan-require-dev
+	+$(MAKE) -B colibri VULKAN=0 EXTRA_WARNINGS=-Werror && \
+		$(MAKE) -B colibri vulkan-strict-flags-check \
+		VULKAN=1 EXTRA_WARNINGS=-Werror && \
+		! nm -g backend_vulkan.o | grep -q 'coli_vulkan_tensor_upload'
 
 vulkan-hardware-test:
 	@if ! $(PKG_CONFIG) --exists vulkan; then \
@@ -665,7 +705,14 @@ vulkan-hardware-test-strict: vulkan-require-dev
 
 vulkan-test:
 	+$(MAKE) vulkan-unit-test && \
+		$(MAKE) vulkan-loader-unit-test && \
 		$(MAKE) vulkan-hardware-test-strict
+
+vulkan-loader-smoke: vulkan-require-dev
+	+$(MAKE) -B colibri VULKAN=1 && \
+		$(PYTHON) tests/test_vulkan_loader_smoke.py \
+		$(if $(strip $(VULKAN_SMOKE_MODEL)),--model "$(VULKAN_SMOKE_MODEL)",) \
+		--binary ./colibri --ref ref_glm.json
 
 test: test-c test-python
 
@@ -726,4 +773,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-require-dev vulkan-unit-test vulkan-sanitize-test vulkan-device-lost-sanitize-test vulkan-hardware-test vulkan-hardware-test-strict vulkan-test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test vulkan-require-dev vulkan-strict-flags-check vulkan-strict-compile-test vulkan-unit-test vulkan-loader-unit-test vulkan-sanitize-test vulkan-loader-sanitize-test vulkan-device-lost-sanitize-test vulkan-hardware-test vulkan-hardware-test-strict vulkan-test vulkan-loader-smoke check clean install uninstall bench
